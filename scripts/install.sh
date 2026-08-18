@@ -25,10 +25,14 @@ fi
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RPM_DIR="$ROOT_DIR/rpms"
 SAMBLY_BIN="$ROOT_DIR/webui/sambly/sambly"
-EXPECTED_VERSION="4.11.12-32.p11.ky10"
+SAMBA_NEVR="4.11.12-32.p11.ky10"
 
 if [[ ! -d "$RPM_DIR" ]]; then
   echo "错误：找不到 RPM 目录：$RPM_DIR" >&2
+  exit 1
+fi
+if [[ ! -f "$RPM_DIR/repodata/repomd.xml" ]]; then
+  echo "错误：离线包缺少 rpms/repodata/repomd.xml，无法作为完整本地软件仓库安装。" >&2
   exit 1
 fi
 if [[ ! -x "$SAMBLY_BIN" ]]; then
@@ -36,29 +40,12 @@ if [[ ! -x "$SAMBLY_BIN" ]]; then
   exit 1
 fi
 
-EXPECTED_PACKAGES=(
-  samba
-  samba-libs
-  samba-common-tools
-  samba-client
-  samba-common
-  libwbclient
-  libsmbclient
-)
-
-rpm_files=()
-for pkg in "${EXPECTED_PACKAGES[@]}"; do
-  rpm_path="$RPM_DIR/${pkg}-${EXPECTED_VERSION}.aarch64.rpm"
-  if [[ ! -f "$rpm_path" ]]; then
-    echo "错误：缺少 ${pkg}-${EXPECTED_VERSION}.aarch64.rpm" >&2
-    exit 1
-  fi
-  rpm_files+=("$rpm_path")
-done
-
-actual_count="$(find "$RPM_DIR" -maxdepth 1 -type f -name '*.rpm' | wc -l)"
-if [[ "$actual_count" -ne 7 ]]; then
-  echo "错误：最小包应恰好包含 7 个 RPM，当前：$actual_count" >&2
+if command -v dnf >/dev/null 2>&1; then
+  PKG_MGR="dnf"
+elif command -v yum >/dev/null 2>&1; then
+  PKG_MGR="yum"
+else
+  echo "错误：系统中未找到 dnf/yum。" >&2
   exit 1
 fi
 
@@ -69,8 +56,9 @@ fi
 
 BACKUP_DIR="/root/samba-sambly-backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
+rpm -qa | sort > "$BACKUP_DIR/packages-before-all.txt"
 rpm -qa | grep -E '^(samba|libwbclient|libsmbclient|libtalloc|libtdb|libtevent|libldb)' | sort \
-  > "$BACKUP_DIR/packages-before.txt" || true
+  > "$BACKUP_DIR/packages-before-samba.txt" || true
 if [[ -f /etc/samba/smb.conf ]]; then
   cp -a /etc/samba/smb.conf "$BACKUP_DIR/smb.conf"
 fi
@@ -79,33 +67,64 @@ if [[ -d /var/lib/samba/private ]]; then
 fi
 
 echo "== 当前 Samba 相关包 =="
-cat "$BACKUP_DIR/packages-before.txt" || true
+cat "$BACKUP_DIR/packages-before-samba.txt" || true
+
+REPO_FILE="/etc/yum.repos.d/samba-offline-local.repo"
+cat > "$REPO_FILE" <<EOF
+[samba-offline-local]
+name=Kylin Samba Offline Local Repository
+baseurl=file://$RPM_DIR
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+metadata_expire=0
+EOF
+
+cleanup_repo() {
+  rm -f "$REPO_FILE"
+}
+trap cleanup_repo EXIT
+
+TARGETS=(
+  "samba-${SAMBA_NEVR}.aarch64"
+  "samba-client-${SAMBA_NEVR}.aarch64"
+  "samba-common-${SAMBA_NEVR}.aarch64"
+  "samba-common-tools-${SAMBA_NEVR}.aarch64"
+)
+
+COMMON_ARGS=(
+  --disablerepo='*'
+  --enablerepo='samba-offline-local'
+  --setopt=install_weak_deps=False
+  --nogpgcheck
+)
+
+"$PKG_MGR" "${COMMON_ARGS[@]}" clean metadata >/dev/null 2>&1 || true
+"$PKG_MGR" "${COMMON_ARGS[@]}" makecache
 
 echo
-echo "== RPM 事务预检查（不会修改系统） =="
-if ! rpm -Uvh --test "${rpm_files[@]}"; then
+echo "== 离线事务预检查（不会修改系统） =="
+if ! "$PKG_MGR" -y "${COMMON_ARGS[@]}" --setopt=tsflags=test install "${TARGETS[@]}"; then
   echo >&2
-  echo "依赖预检查失败，未安装任何软件。" >&2
-  echo "请把上面的缺失依赖原样反馈，不要使用 --nodeps 强制安装。" >&2
+  echo "依赖事务预检查失败，未安装任何软件。" >&2
+  echo "本 Release 应包含 Samba 所有强依赖；请把上面的完整错误反馈回来。" >&2
+  echo "不要使用 --nodeps，也不要临时启用互联网软件源。" >&2
   exit 2
 fi
 
 echo
-echo "== 安装/升级最小 Samba 4.11 p11 组件 =="
-if command -v dnf >/dev/null 2>&1; then
-  dnf -y --disablerepo='*' install "${rpm_files[@]}"
-elif command -v yum >/dev/null 2>&1; then
-  yum -y --disablerepo='*' localinstall "${rpm_files[@]}"
-else
-  echo "错误：系统中未找到 dnf/yum。" >&2
-  exit 1
-fi
+echo "== 从完整本地仓库安装/升级 Samba 4.11 p11 =="
+"$PKG_MGR" -y "${COMMON_ARGS[@]}" install "${TARGETS[@]}"
 
 echo
 echo "== Samba 安装验证 =="
 command -v smbd
 command -v testparm
 smbd -V
+if [[ "$(smbd -V)" != *"4.11.12"* ]]; then
+  echo "错误：安装后的 smbd 版本不是预期的 Samba 4.11.12。" >&2
+  exit 3
+fi
 if [[ -f /etc/samba/smb.conf ]]; then
   testparm -s /etc/samba/smb.conf >/dev/null
 else
@@ -195,6 +214,6 @@ if [[ -f /var/lib/sambly/initial-credentials.txt ]]; then
   echo "登录并修改密码后建议删除该凭据文件。"
 fi
 echo
-echo "注意：本脚本没有启动 Samba，也没有修改现有 smb.conf。"
+echo "注意：本脚本没有自动启动 Samba，也没有修改现有 smb.conf。"
 echo "安装前备份：$BACKUP_DIR"
 echo "下一步在 DFS 入口服务器运行：sudo bash configure-dfs-root.sh"

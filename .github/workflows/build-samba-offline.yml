@@ -1,4 +1,4 @@
-name: Build Kylin Samba + Sambly Minimal Offline Bundle
+name: Build Kylin Samba + Sambly Full Offline Bundle
 
 on:
   workflow_dispatch:
@@ -19,12 +19,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: samba-sambly-minimal-${{ github.ref }}
+  group: samba-sambly-full-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  BUNDLE_NAME: kylin-v10sp3-aarch64-samba-sambly-minimal
-  RELEASE_TAG: samba-sambly-kylin-v10sp3-aarch64
+  BUNDLE_NAME: kylin-v10sp3-aarch64-samba-sambly-full
+  RELEASE_TAG: samba-sambly-kylin-v10sp3-aarch64-full
   SAMBA_NEVR: 4.11.12-32.p11.ky10
   SAMBLY_REPO: https://github.com/buadamlaz/Sambly.git
   SAMBLY_COMMIT: 3dab4b2713bc9b4b17f0b903c82600028f44f852
@@ -35,66 +35,53 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Validate repository inputs
+      - uses: actions/checkout@v4
+      - name: Validate scripts and DFS settings
         run: |
           set -euxo pipefail
           for f in scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh; do
             test -s "$f"
             bash -n "$f"
           done
-          grep -Fq 'rpm -Uvh --test' scripts/install.sh
-          grep -Fq 'SAMBLY_PORT' scripts/install.sh
+          grep -Fq 'samba-offline-local' scripts/install.sh
+          grep -Fq 'tsflags=test' scripts/install.sh
+          grep -Fq -- "--disablerepo='*'" scripts/install.sh
           grep -Fq 'msdfs root = yes' scripts/configure-dfs-root.sh
           grep -Fq 'msdfs:' scripts/add-dfs-target.sh
 
   build:
-    name: Full minimal ARM64 bundle
+    name: Build verified full ARM64 bundle
     needs: validate
-    # PR updates only run the cheap static check. Full package download/build
-    # happens only for workflow_dispatch or after merge/push to main.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
+    timeout-minutes: 90
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Prepare ARM64 emulation
+      - name: Enable ARM64 emulation
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
-      - name: Prepare bundle directories
+      - name: Prepare bundle
         run: |
           set -euxo pipefail
           rm -rf build third_party
-          mkdir -p "build/${BUNDLE_NAME}/rpms"
-          mkdir -p "build/${BUNDLE_NAME}/webui/sambly"
-          mkdir -p "build/${BUNDLE_NAME}/licenses"
-          mkdir -p third_party
-
-          cp scripts/install.sh "build/${BUNDLE_NAME}/install.sh"
-          cp scripts/configure-dfs-root.sh "build/${BUNDLE_NAME}/configure-dfs-root.sh"
-          cp scripts/add-dfs-target.sh "build/${BUNDLE_NAME}/add-dfs-target.sh"
+          mkdir -p "build/${BUNDLE_NAME}/rpms" "build/${BUNDLE_NAME}/webui/sambly" "build/${BUNDLE_NAME}/licenses" third_party
+          cp scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh "build/${BUNDLE_NAME}/"
           chmod +x "build/${BUNDLE_NAME}"/*.sh
 
-      - name: Download exactly seven official Kylin Samba RPMs
+      - name: Resolve, download and prove complete Kylin RPM closure
         run: |
           set -euxo pipefail
           docker run --rm --platform linux/arm64 \
             -e BUNDLE_NAME="$BUNDLE_NAME" \
             -e SAMBA_NEVR="$SAMBA_NEVR" \
-            -v "$PWD:/work" \
-            -w /work \
-            rockylinux:8 \
+            -v "$PWD:/work" -w /work rockylinux:8 \
             bash -euxo pipefail -c '
-              dnf -y install dnf-plugins-core rpm findutils
+              dnf -y install dnf-plugins-core createrepo_c rpm findutils
 
-              cat > /etc/yum.repos.d/kylin-offline.repo <<"EOF"
+              cat >/etc/yum.repos.d/kylin-offline.repo <<"EOF"
           [kylin-v10sp3-base]
           name=Kylin V10 SP3 2403 Base aarch64
           baseurl=https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/base/aarch64/
@@ -112,188 +99,149 @@ jobs:
           metadata_expire=0
           EOF
 
-              dnf clean all
-              dnf makecache \
-                --disablerepo="*" \
-                --enablerepo=kylin-v10sp3-base,kylin-v10sp3-updates
-
-              packages=(
-                samba
-                samba-libs
-                samba-common-tools
-                samba-client
-                samba-common
-                libwbclient
-                libsmbclient
+              repos="kylin-v10sp3-base,kylin-v10sp3-updates"
+              roots=(
+                "samba-${SAMBA_NEVR}.aarch64"
+                "samba-client-${SAMBA_NEVR}.aarch64"
+                "samba-common-${SAMBA_NEVR}.aarch64"
+                "samba-common-tools-${SAMBA_NEVR}.aarch64"
               )
 
-              for pkg in "${packages[@]}"; do
-                dnf \
-                  --disablerepo="*" \
-                  --enablerepo=kylin-v10sp3-base,kylin-v10sp3-updates \
-                  download \
-                  --destdir="/work/build/${BUNDLE_NAME}/rpms" \
-                  "${pkg}-${SAMBA_NEVR}.aarch64"
+              dnf clean all
+              dnf makecache --disablerepo="*" --enablerepo="$repos"
+
+              # Download every recursively required strong dependency even when the
+              # ARM64 build container already has a compatible provider installed.
+              dnf --disablerepo="*" --enablerepo="$repos" \
+                --setopt=install_weak_deps=False \
+                download --resolve --alldeps \
+                --destdir="/work/build/${BUNDLE_NAME}/rpms" \
+                "${roots[@]}"
+
+              for root in "${roots[@]}"; do
+                test -f "/work/build/${BUNDLE_NAME}/rpms/${root}.rpm"
               done
 
-              count="$(find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" | wc -l)"
-              test "$count" -eq 7
+              rpm_count="$(find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" | wc -l)"
+              test "$rpm_count" -gt 7
 
-              for pkg in "${packages[@]}"; do
-                test -f "/work/build/${BUNDLE_NAME}/rpms/${pkg}-${SAMBA_NEVR}.aarch64.rpm"
-              done
+              while IFS= read -r -d "" f; do
+                arch="$(rpm -qp --qf "%{ARCH}" "$f")"
+                case "$arch" in aarch64|noarch) ;; *) echo "bad arch: $arch $f" >&2; exit 1;; esac
+              done < <(find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" -print0)
 
-              find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" -print0 \
-                | sort -z \
+              createrepo_c "/work/build/${BUNDLE_NAME}/rpms"
+
+              find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" -print0 | sort -z \
                 | xargs -0 -r rpm -qp --qf "%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n" \
                 > "/work/build/${BUNDLE_NAME}/packages-manifest.txt"
+              find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" -print0 | sort -z \
+                | xargs -0 -r rpm -qpR > "/work/build/${BUNDLE_NAME}/rpm-requires.txt"
+              printf "%s\n" "${roots[@]}" > "/work/build/${BUNDLE_NAME}/root-packages.txt"
 
-              find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" -print0 \
-                | sort -z \
-                | xargs -0 -r rpm -qpR \
-                > "/work/build/${BUNDLE_NAME}/rpm-requires.txt"
+              cat > "/work/build/${BUNDLE_NAME}/kylin-repositories.txt" <<"EOF"
+          https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/base/aarch64/
+          https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/updates/aarch64/
+          EOF
+
+              # Strong proof: install the pinned Samba roots into an empty filesystem
+              # using ONLY the generated local repository. Missing dependencies fail here.
+              rm -rf /tmp/kylin-offline-root
+              mkdir -p /tmp/kylin-offline-root
+              dnf -y --installroot=/tmp/kylin-offline-root --releasever=10 \
+                --disablerepo="*" \
+                --repofrompath=samba-offline,file:///work/build/${BUNDLE_NAME}/rpms \
+                --enablerepo=samba-offline --nogpgcheck \
+                --setopt=install_weak_deps=False \
+                --setopt=module_platform_id=platform:el8 \
+                install "${roots[@]}"
+
+              rpm --root /tmp/kylin-offline-root -q samba samba-client samba-common samba-common-tools
+              rpm --root /tmp/kylin-offline-root -qa --qf "%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n" | sort \
+                > "/work/build/${BUNDLE_NAME}/offline-installroot-packages.txt"
+              grep -Eq "^samba 4\\.11\\.12-32\\.p11\\.ky10 aarch64$" \
+                "/work/build/${BUNDLE_NAME}/offline-installroot-packages.txt"
             '
 
-      - name: Validate minimal RPM set
+      - name: Validate RPM evidence
         run: |
           set -euxo pipefail
-          manifest="build/${BUNDLE_NAME}/packages-manifest.txt"
-          test "$(wc -l < "$manifest")" -eq 7
-
-          for pkg in samba samba-libs samba-common-tools samba-client samba-common libwbclient libsmbclient; do
-            grep -Eq "^${pkg} 4\\.11\\.12-32\\.p11\\.ky10 aarch64$" "$manifest"
+          bundle="build/${BUNDLE_NAME}"
+          count="$(find "$bundle/rpms" -maxdepth 1 -type f -name '*.rpm' | wc -l)"
+          test "$count" -gt 7
+          test -f "$bundle/rpms/repodata/repomd.xml"
+          test -s "$bundle/offline-installroot-packages.txt"
+          for pkg in samba samba-client samba-common samba-common-tools; do
+            grep -Eq "^${pkg} 4\\.11\\.12-32\\.p11\\.ky10 aarch64$" "$bundle/packages-manifest.txt"
           done
-
-          if grep -Eq '^(cockpit|python3-samba|samba-dc|samba-help) ' "$manifest"; then
-            echo "Unexpected package in minimal bundle" >&2
-            cat "$manifest" >&2
+          if grep -Eq ' (x86_64|i[3-6]86)$' "$bundle/packages-manifest.txt"; then
+            echo 'non-ARM RPM detected' >&2
             exit 1
           fi
+          echo "Resolved RPM count: $count"
+          du -sh "$bundle/rpms"
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22.x'
-          cache: false
-
-      - name: Test and build Sambly static ARM64 binary
+      - name: Build and test Sambly ARM64 static binary
         run: |
           set -euxo pipefail
           git clone "$SAMBLY_REPO" third_party/Sambly
           git -C third_party/Sambly checkout --detach "$SAMBLY_COMMIT"
-
           (
             cd third_party/Sambly
             test "$(git rev-parse HEAD)" = "$SAMBLY_COMMIT"
             go test ./...
-            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-              go build -trimpath -ldflags='-s -w' \
-              -o "../../build/${BUNDLE_NAME}/webui/sambly/sambly" \
-              ./cmd/server
+            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
+              -o "../../build/${BUNDLE_NAME}/webui/sambly/sambly" ./cmd/server
           )
-
           chmod +x "build/${BUNDLE_NAME}/webui/sambly/sambly"
           file "build/${BUNDLE_NAME}/webui/sambly/sambly"
           readelf -h "build/${BUNDLE_NAME}/webui/sambly/sambly" | grep -q 'AArch64'
           if readelf -d "build/${BUNDLE_NAME}/webui/sambly/sambly" 2>/dev/null | grep -q '(NEEDED)'; then
-            echo 'Sambly binary unexpectedly has dynamic library dependencies.' >&2
+            echo 'Sambly unexpectedly has dynamic library dependencies' >&2
             exit 1
           fi
-
           cp third_party/Sambly/LICENSE "build/${BUNDLE_NAME}/licenses/Sambly-LICENSE"
-          printf '%s\n' \
-            "Sambly source: https://github.com/buadamlaz/Sambly" \
-            "Pinned commit: ${SAMBLY_COMMIT}" \
-            "Build: CGO_ENABLED=0 GOOS=linux GOARCH=arm64" \
+          printf '%s\n' "source=$SAMBLY_REPO" "commit=$SAMBLY_COMMIT" \
             > "build/${BUNDLE_NAME}/webui/sambly/SOURCE.txt"
 
-      - name: Create minimal bundle
+      - name: Package and audit
         run: |
           set -euxo pipefail
-          cat > "build/${BUNDLE_NAME}/README.txt" <<EOF
-          Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Minimal Offline Bundle
-          =================================================================
+          bundle="build/${BUNDLE_NAME}"
+          count="$(find "$bundle/rpms" -maxdepth 1 -type f -name '*.rpm' | wc -l)"
+          cat > "$bundle/README.txt" <<EOF
+          Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Full Offline Bundle
+          Target: Kylin Linux Advanced Server V10 SP3-2403 aarch64
+          Samba: 4.11.12-32.p11.ky10
+          Resolved RPM count: ${count}
 
-          Target:
-            Kylin Linux Advanced Server V10 SP3-2403 aarch64
+          The RPM set is the recursively resolved strong dependency closure from
+          Kylin official Base/Updates repositories. The workflow verified it by
+          installing Samba into an empty installroot using only rpms/ as file:// repo.
 
-          This bundle is intentionally tailored to the existing Kylin server
-          baseline and contains exactly seven Samba p11 RPMs, not a complete
-          blank-system dependency closure.
-
-          Included Samba RPMs:
-            samba
-            samba-libs
-            samba-common-tools
-            samba-client
-            samba-common
-            libwbclient
-            libsmbclient
-
-          Also included:
-            Sambly static ARM64 single binary
-            install.sh
-            configure-dfs-root.sh
-            add-dfs-target.sh
-
-          Install:
-            sudo bash install.sh
-
-          The installer first runs rpm -Uvh --test. If this host is missing a
-          dependency, installation stops before changing packages. Do not use
-          --nodeps; collect the reported missing dependency instead.
-
-          Configure this server as DFS Root:
-            sudo bash configure-dfs-root.sh
-
-          Add a backend:
-            sudo bash add-dfs-target.sh kylin01 192.168.88.211 ledong_share
-
-          Sambly:
-            http://<server-ip>:8090
-
-          Windows DFS entry:
-            \\\\<server-ip>\\files
+          Install: sudo bash install.sh
+          DFS root: sudo bash configure-dfs-root.sh
+          Add target: sudo bash add-dfs-target.sh kylin01 192.168.88.211 ledong_share
+          Windows: \\\\<DFS-IP>\\files
           EOF
 
-          (
-            cd "build/${BUNDLE_NAME}"
-            find rpms -maxdepth 1 -type f -name '*.rpm' -print0 | sort -z | xargs -0 sha256sum
-            sha256sum \
-              install.sh configure-dfs-root.sh add-dfs-target.sh \
-              packages-manifest.txt rpm-requires.txt README.txt \
-              webui/sambly/sambly webui/sambly/SOURCE.txt licenses/Sambly-LICENSE
-          ) > "build/${BUNDLE_NAME}/SHA256SUMS"
+          (cd "$bundle" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          tar -C build -czf "build/${BUNDLE_NAME}.tar.gz" "$BUNDLE_NAME"
+          (cd build && sha256sum "${BUNDLE_NAME}.tar.gz" > "${BUNDLE_NAME}.tar.gz.sha256")
 
-          tar -C build -czf "build/${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
-          (
-            cd build
-            sha256sum "${BUNDLE_NAME}.tar.gz" > "${BUNDLE_NAME}.tar.gz.sha256"
-          )
-
-      - name: Audit final artifact
-        run: |
-          set -euxo pipefail
           cd build
           sha256sum -c "${BUNDLE_NAME}.tar.gz.sha256"
-
-          audit_dir="$(mktemp -d)"
-          trap 'rm -rf "$audit_dir"' EXIT
-          tar -xzf "${BUNDLE_NAME}.tar.gz" -C "$audit_dir"
-          bundle="$audit_dir/${BUNDLE_NAME}"
-
-          (
-            cd "$bundle"
-            sha256sum -c SHA256SUMS
-            bash -n install.sh
-            bash -n configure-dfs-root.sh
-            bash -n add-dfs-target.sh
-            test -x webui/sambly/sambly
-            test "$(find rpms -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 7
-          )
-
-          readelf -h "$bundle/webui/sambly/sambly" | grep -q 'AArch64'
-          du -sh "$bundle" "${BUNDLE_NAME}.tar.gz"
+          audit="$(mktemp -d)"
+          trap 'rm -rf "$audit"' EXIT
+          tar -xzf "${BUNDLE_NAME}.tar.gz" -C "$audit"
+          cd "$audit/${BUNDLE_NAME}"
+          sha256sum -c SHA256SUMS
+          bash -n install.sh
+          bash -n configure-dfs-root.sh
+          bash -n add-dfs-target.sh
+          test -f rpms/repodata/repomd.xml
+          test "$(find rpms -maxdepth 1 -type f -name '*.rpm' | wc -l)" -gt 7
+          readelf -h webui/sambly/sambly | grep -q 'AArch64'
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -305,21 +253,17 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish GitHub Release
+      - name: Publish verified Release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
+          notes='Verified full offline bundle for Kylin V10 SP3-2403 aarch64: Samba 4.11.12-32.p11 plus recursively resolved strong dependencies from Kylin official repositories, empty-installroot offline proof, Sambly ARM64 static binary, DFS helpers and SHA256 checksums.'
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" \
-              "build/${BUNDLE_NAME}.tar.gz" \
-              "build/${BUNDLE_NAME}.tar.gz.sha256" \
-              --clobber
+            gh release upload "$RELEASE_TAG" "build/${BUNDLE_NAME}.tar.gz" "build/${BUNDLE_NAME}.tar.gz.sha256" --clobber
+            gh release edit "$RELEASE_TAG" --title 'Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Full Offline Bundle' --notes "$notes"
           else
-            gh release create "$RELEASE_TAG" \
-              "build/${BUNDLE_NAME}.tar.gz" \
-              "build/${BUNDLE_NAME}.tar.gz.sha256" \
-              --title "Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Minimal Offline Bundle" \
-              --notes "Minimal native bundle for the target Kylin V10 SP3 aarch64 server: exactly seven official Kylin Samba 4.11.12 p11 RPMs, Sambly static ARM64 Web UI, transaction preflight, DFS Root helper and checksums."
+            gh release create "$RELEASE_TAG" "build/${BUNDLE_NAME}.tar.gz" "build/${BUNDLE_NAME}.tar.gz.sha256" \
+              --title 'Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Full Offline Bundle' --notes "$notes"
           fi
