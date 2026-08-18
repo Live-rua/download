@@ -59,6 +59,7 @@ jobs:
           mkdir -p "build/${BUNDLE_NAME}/rpms"
           mkdir -p "build/${BUNDLE_NAME}/webui/sambly"
           mkdir -p "build/${BUNDLE_NAME}/licenses"
+          mkdir -p build/addon-repo
           mkdir -p third_party
 
           cp scripts/install.sh "build/${BUNDLE_NAME}/install.sh"
@@ -72,12 +73,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
+          # Keep the upstream RPM in a separate source repo. DNF will then copy it
+          # into the final rpms/ directory while resolving its Kylin dependencies.
           gh release download "$COCKPIT_FS_TAG" \
             --repo 45Drives/cockpit-file-sharing \
             --pattern '*el9.noarch.rpm' \
-            --dir "build/${BUNDLE_NAME}/rpms"
-          test -n "$(find "build/${BUNDLE_NAME}/rpms" -maxdepth 1 -name 'cockpit-file-sharing-*.el9.noarch.rpm' -print -quit)"
-          ls -lh "build/${BUNDLE_NAME}/rpms"/cockpit-file-sharing-*.el9.noarch.rpm
+            --dir build/addon-repo
+          test -n "$(find build/addon-repo -maxdepth 1 -name 'cockpit-file-sharing-*.el9.noarch.rpm' -print -quit)"
+          ls -lh build/addon-repo/cockpit-file-sharing-*.el9.noarch.rpm
 
       - name: Download Kylin V10 SP3 ARM64 packages and full dependency closure
         run: |
@@ -108,15 +111,15 @@ jobs:
           metadata_expire=0
           EOF
 
-              # Expose the third-party noarch Cockpit plugin as a temporary local
-              # repository so DNF also resolves its complete runtime dependency tree
-              # from the official Kylin repositories.
-              createrepo_c /work/build/${BUNDLE_NAME}/rpms
+              # Expose the upstream noarch Cockpit plugin as a separate temporary
+              # repository so DNF resolves its complete runtime dependency tree
+              # from official Kylin repositories into the final rpms/ directory.
+              createrepo_c /work/build/addon-repo
               cat >> /etc/yum.repos.d/kylin-offline.repo <<EOF
 
           [offline-addons]
           name=Offline third-party addons
-          baseurl=file:///work/build/${BUNDLE_NAME}/rpms
+          baseurl=file:///work/build/addon-repo
           enabled=1
           gpgcheck=0
           metadata_expire=0
@@ -151,6 +154,8 @@ jobs:
 
               rpm -qpR /work/build/${BUNDLE_NAME}/rpms/cockpit-file-sharing-*.noarch.rpm \
                 > /work/build/${BUNDLE_NAME}/cockpit-file-sharing-requires.txt
+
+              rm -rf /work/build/addon-repo
             '
 
       - name: Set up Go for Sambly ARM64 build
