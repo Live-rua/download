@@ -16,73 +16,185 @@ if [[ ! -f /etc/os-release ]]; then
   echo "错误：无法识别操作系统。" >&2
   exit 1
 fi
-
 . /etc/os-release
 if [[ "${ID:-}" != "kylin" || "${VERSION_ID:-}" != "V10" ]]; then
-  echo "警告：目标是 Kylin Linux Advanced Server V10，当前：${PRETTY_NAME:-unknown}"
-  read -r -p "仍要继续？[y/N] " ans
-  [[ "$ans" =~ ^[Yy]$ ]] || exit 1
+  echo "错误：此包仅针对 Kylin Linux Advanced Server V10，当前：${PRETTY_NAME:-unknown}" >&2
+  exit 1
 fi
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RPM_DIR="$ROOT_DIR/rpms"
+SAMBLY_BIN="$ROOT_DIR/webui/sambly/sambly"
+EXPECTED_VERSION="4.11.12-32.p11.ky10"
 
 if [[ ! -d "$RPM_DIR" ]]; then
   echo "错误：找不到 RPM 目录：$RPM_DIR" >&2
   exit 1
 fi
+if [[ ! -x "$SAMBLY_BIN" ]]; then
+  echo "错误：找不到 Sambly ARM64 二进制：$SAMBLY_BIN" >&2
+  exit 1
+fi
 
-if ! command -v dnf >/dev/null 2>&1 && ! command -v yum >/dev/null 2>&1; then
+EXPECTED_PACKAGES=(
+  samba
+  samba-libs
+  samba-common-tools
+  samba-client
+  samba-common
+  libwbclient
+  libsmbclient
+)
+
+rpm_files=()
+for pkg in "${EXPECTED_PACKAGES[@]}"; do
+  rpm_path="$RPM_DIR/${pkg}-${EXPECTED_VERSION}.aarch64.rpm"
+  if [[ ! -f "$rpm_path" ]]; then
+    echo "错误：缺少 ${pkg}-${EXPECTED_VERSION}.aarch64.rpm" >&2
+    exit 1
+  fi
+  rpm_files+=("$rpm_path")
+done
+
+actual_count="$(find "$RPM_DIR" -maxdepth 1 -type f -name '*.rpm' | wc -l)"
+if [[ "$actual_count" -ne 7 ]]; then
+  echo "错误：最小包应恰好包含 7 个 RPM，当前：$actual_count" >&2
+  exit 1
+fi
+
+if [[ -f "$ROOT_DIR/SHA256SUMS" ]]; then
+  echo "== 校验离线包完整性 =="
+  (cd "$ROOT_DIR" && sha256sum -c SHA256SUMS)
+fi
+
+BACKUP_DIR="/root/samba-sambly-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+rpm -qa | grep -E '^(samba|libwbclient|libsmbclient|libtalloc|libtdb|libtevent|libldb)' | sort \
+  > "$BACKUP_DIR/packages-before.txt" || true
+if [[ -f /etc/samba/smb.conf ]]; then
+  cp -a /etc/samba/smb.conf "$BACKUP_DIR/smb.conf"
+fi
+if [[ -d /var/lib/samba/private ]]; then
+  cp -a /var/lib/samba/private "$BACKUP_DIR/samba-private" 2>/dev/null || true
+fi
+
+echo "== 当前 Samba 相关包 =="
+cat "$BACKUP_DIR/packages-before.txt" || true
+
+echo
+echo "== RPM 事务预检查（不会修改系统） =="
+if ! rpm -Uvh --test "${rpm_files[@]}"; then
+  echo >&2
+  echo "依赖预检查失败，未安装任何软件。" >&2
+  echo "请把上面的缺失依赖原样反馈，不要使用 --nodeps 强制安装。" >&2
+  exit 2
+fi
+
+echo
+echo "== 安装/升级最小 Samba 4.11 p11 组件 =="
+if command -v dnf >/dev/null 2>&1; then
+  dnf -y --disablerepo='*' install "${rpm_files[@]}"
+elif command -v yum >/dev/null 2>&1; then
+  yum -y --disablerepo='*' localinstall "${rpm_files[@]}"
+else
   echo "错误：系统中未找到 dnf/yum。" >&2
   exit 1
 fi
 
-PKG_MGR="dnf"
-command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
-
-BACKUP_DIR="/root/samba-offline-backup-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-
+echo
+echo "== Samba 安装验证 =="
+command -v smbd
+command -v testparm
+smbd -V
 if [[ -f /etc/samba/smb.conf ]]; then
-  cp -a /etc/samba/smb.conf "$BACKUP_DIR/smb.conf"
-  echo "已备份现有配置到：$BACKUP_DIR/smb.conf"
+  testparm -s /etc/samba/smb.conf >/dev/null
+else
+  echo "提示：当前还没有 /etc/samba/smb.conf；configure-dfs-root.sh 会创建 DFS 配置。"
+fi
+rpm -qa | grep -E '^(samba|libwbclient|libsmbclient)' | sort
+
+# Sambly 上游使用 smbd.service 控制 Samba；Kylin/RHEL RPM 通常提供 smb.service。
+# 创建 systemd alias，使 UI 的启停/重启按钮可以直接工作。
+if ! systemctl cat smbd.service >/dev/null 2>&1; then
+  SMB_UNIT="$(systemctl show -p FragmentPath --value smb.service 2>/dev/null || true)"
+  if [[ -z "$SMB_UNIT" || ! -f "$SMB_UNIT" ]]; then
+    SMB_UNIT="/usr/lib/systemd/system/smb.service"
+  fi
+  if [[ -f "$SMB_UNIT" ]]; then
+    ln -sfn "$SMB_UNIT" /etc/systemd/system/smbd.service
+    systemctl daemon-reload
+    echo "已创建 Sambly 兼容别名：smbd.service -> $SMB_UNIT"
+  else
+    echo "警告：没有找到 smb.service；Sambly 的服务控制按钮可能不可用。" >&2
+  fi
 fi
 
-rpm -qa | grep -Ei '^samba|^libwbclient|^libsmbclient' | sort > "$BACKUP_DIR/packages-before.txt" || true
+echo
+echo "== 安装 Sambly ARM64 单二进制 =="
+install -m 0755 "$SAMBLY_BIN" /usr/local/bin/sambly
+install -d -m 0750 /var/lib/sambly
 
-cat > /etc/yum.repos.d/samba-offline-local.repo <<EOF
-[samba-offline-local]
-name=Samba Offline Local Repository
-baseurl=file://$RPM_DIR
-enabled=1
-gpgcheck=0
-metadata_expire=0
-EOF
+SAMBLY_PORT="${SAMBLY_PORT:-8090}"
+SAMBLY_ADMIN_USER="${SAMBLY_ADMIN_USER:-admin}"
+SAMBLY_ADMIN_PASSWORD="${SAMBLY_ADMIN_PASSWORD:-}"
 
-cleanup() {
-  rm -f /etc/yum.repos.d/samba-offline-local.repo
-}
-trap cleanup EXIT
-
-if [[ ! -d "$RPM_DIR/repodata" ]]; then
-  echo "错误：离线包缺少 rpms/repodata。" >&2
+if ! [[ "$SAMBLY_PORT" =~ ^[0-9]+$ ]] || (( SAMBLY_PORT < 1 || SAMBLY_PORT > 65535 )); then
+  echo "错误：SAMBLY_PORT 必须是 1-65535。" >&2
+  exit 1
+fi
+if ! [[ "$SAMBLY_ADMIN_USER" =~ ^[a-zA-Z0-9_.-]{1,32}$ ]]; then
+  echo "错误：SAMBLY_ADMIN_USER 格式不合法。" >&2
   exit 1
 fi
 
-echo "== 安装/升级 Samba 服务器及工具 =="
-"$PKG_MGR" --disablerepo='*' --enablerepo='samba-offline-local' clean metadata >/dev/null 2>&1 || true
-"$PKG_MGR" -y --disablerepo='*' --enablerepo='samba-offline-local' install \
-  samba samba-client samba-common samba-common-tools
+if [[ ! -f /var/lib/sambly/sambly.db ]]; then
+  {
+    printf 'ADMIN_USERNAME=%s\n' "$SAMBLY_ADMIN_USER"
+    if [[ -n "$SAMBLY_ADMIN_PASSWORD" ]]; then
+      printf 'ADMIN_PASSWORD=%s\n' "$SAMBLY_ADMIN_PASSWORD"
+    fi
+  } > /var/lib/sambly/setup.env
+  chmod 0600 /var/lib/sambly/setup.env
+fi
 
-echo
-echo "== 版本验证 =="
-smbd -V
-command -v testparm
-rpm -qa | grep -Ei '^samba|^libwbclient|^libsmbclient' | sort
+cat > /etc/systemd/system/sambly.service <<EOF
+[Unit]
+Description=Sambly - Samba Web Manager
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/sambly --addr=0.0.0.0:${SAMBLY_PORT} --data=/var/lib/sambly
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now sambly
+
+for _ in $(seq 1 15); do
+  [[ -f /var/lib/sambly/initial-credentials.txt ]] && break
+  systemctl is-active --quiet sambly || break
+  sleep 1
+done
 
 echo
 echo "安装完成。"
-echo "- 没有自动覆盖 /etc/samba/smb.conf"
-echo "- 没有自动启动/启用 smb、nmb 服务"
-echo "- 安装前信息备份：$BACKUP_DIR"
-echo "下一步如需建立 DFS Root，可运行：sudo bash configure-dfs-root.sh"
+echo "Samba：$(smbd -V)"
+echo "Sambly：http://<服务器IP>:${SAMBLY_PORT}"
+echo "Sambly 状态：systemctl status sambly --no-pager -l"
+if [[ -f /var/lib/sambly/initial-credentials.txt ]]; then
+  echo "首次登录凭据："
+  cat /var/lib/sambly/initial-credentials.txt
+  echo "登录并修改密码后建议删除该凭据文件。"
+fi
+echo
+echo "注意：本脚本没有启动 Samba，也没有修改现有 smb.conf。"
+echo "安装前备份：$BACKUP_DIR"
+echo "下一步在 DFS 入口服务器运行：sudo bash configure-dfs-root.sh"

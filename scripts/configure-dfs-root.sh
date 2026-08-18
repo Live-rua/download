@@ -14,27 +14,51 @@ fi
 DFS_DIR="/srv/dfs"
 CONF="/etc/samba/smb.conf"
 STAMP="$(date +%Y%m%d-%H%M%S)"
+TMP_CONF="${CONF}.new-${STAMP}"
 
 mkdir -p "$DFS_DIR"
 chmod 0755 "$DFS_DIR"
+mkdir -p /var/log/samba
 
 if [[ -f "$CONF" ]]; then
   cp -a "$CONF" "${CONF}.bak-${STAMP}"
   echo "已备份：${CONF}.bak-${STAMP}"
+
+  # 新服务器的系统默认配置通常只有 global/homes/printers/print$。
+  # 如果已经存在业务共享，不默认覆盖，避免误删现有共享。
+  custom_sections="$(awk '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      s=$0
+      gsub(/^[[:space:]]*\[/,"",s)
+      gsub(/\][[:space:]]*$/,"",s)
+      l=tolower(s)
+      if (l!="global" && l!="homes" && l!="printers" && l!="print$") print s
+    }
+  ' "$CONF" | sort -u)"
+
+  if [[ -n "$custom_sections" && "${FORCE_DFS_CONFIG:-0}" != "1" ]]; then
+    echo "检测到已有自定义共享，默认停止以避免覆盖：" >&2
+    echo "$custom_sections" >&2
+    echo >&2
+    echo "确认这些共享可以被新的 DFS Root 配置替换后，再执行：" >&2
+    echo "  FORCE_DFS_CONFIG=1 bash configure-dfs-root.sh" >&2
+    exit 2
+  fi
 fi
 
-cat > "$CONF" <<'EOF'
+cat > "$TMP_CONF" <<'EOF'
 [global]
         workgroup = SAMBA
+        server role = standalone server
         security = user
 
-        # 仅启用现代 SMB；Windows 无需 SMB1/CIFS 客户端。
-        server min protocol = SMB2
+        # Samba 4.x 只提供现代 SMB；Windows 不需要开启 SMB1/CIFS 客户端。
+        server min protocol = SMB2_02
 
-        # 开启 Microsoft DFS / Samba MSDFS 支持。
+        # 开启 Samba MSDFS / DFS referral。
         host msdfs = yes
 
-        # DFS 入口不承担打印服务。
+        # DFS 入口不提供打印服务。
         load printers = no
         printing = bsd
         printcap name = /dev/null
@@ -50,24 +74,33 @@ cat > "$CONF" <<'EOF'
         read only = yes
         guest ok = no
         msdfs root = yes
-
-        # 正式使用时建议启用并替换为现场统一 Samba 用户组：
-        # valid users = @ledong
 EOF
 
 echo "== testparm 配置检查 =="
-testparm -s "$CONF"
+testparm -s "$TMP_CONF"
+install -m 0644 "$TMP_CONF" "$CONF"
+rm -f "$TMP_CONF"
+
+# Kylin/RHEL Samba RPM 的服务名通常是 smb.service。
+if systemctl cat smb.service >/dev/null 2>&1; then
+  systemctl enable --now smb.service
+else
+  echo "错误：没有找到 smb.service。" >&2
+  exit 3
+fi
 
 echo
-echo "DFS Root 配置已生成：$CONF"
+echo "== Samba 状态 =="
+systemctl status smb.service --no-pager -l || true
+ss -lntp 2>/dev/null | grep -E ':(445|139)[[:space:]]' || true
+
+echo
+echo "DFS Root 已配置完成。"
 echo "DFS 目录：$DFS_DIR"
+echo "Windows 统一入口：\\\\<DFS服务器IP>\\files"
 echo
-echo "接入后端示例（请替换服务器名/IP和共享名）："
-echo "  ln -s 'msdfs:kylin01\\ledong_share' '$DFS_DIR/kylin01'"
-echo "  ln -s 'msdfs:kylin02\\ledong_share' '$DFS_DIR/kylin02'"
-echo
-echo "确认配置后可启动："
-echo "  systemctl enable --now smb"
-echo "  systemctl status smb --no-pager -l"
-echo
-echo "Windows 访问：\\\\<DFS服务器IP>\\files"
+echo "下一步："
+echo "1. 先通过 Sambly 创建至少一个 Samba 用户。"
+echo "2. 使用 add-dfs-target.sh 添加后端服务器，例如："
+echo "   bash add-dfs-target.sh kylin01 192.168.88.211 ledong_share"
+echo "   bash add-dfs-target.sh kylin02 192.168.88.212 ledong_share"
