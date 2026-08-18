@@ -1,4 +1,4 @@
-name: Build Kylin Samba DFS WebUI Offline Bundle
+name: Build Kylin Samba + Sambly Minimal Offline Bundle
 
 on:
   workflow_dispatch:
@@ -19,16 +19,15 @@ permissions:
   contents: write
 
 concurrency:
-  group: samba-dfs-webui-offline-${{ github.ref }}
+  group: samba-sambly-minimal-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  BUNDLE_NAME: kylin-v10sp3-aarch64-samba-dfs-webui-offline
-  RELEASE_TAG: samba-dfs-webui-kylin-v10sp3-aarch64
+  BUNDLE_NAME: kylin-v10sp3-aarch64-samba-sambly-minimal
+  RELEASE_TAG: samba-sambly-kylin-v10sp3-aarch64
+  SAMBA_NEVR: 4.11.12-32.p11.ky10
   SAMBLY_REPO: https://github.com/buadamlaz/Sambly.git
   SAMBLY_COMMIT: 3dab4b2713bc9b4b17f0b903c82600028f44f852
-  COCKPIT_FS_TAG: v4.6.1-2
-  COCKPIT_FS_RELEASE: '4.6.1-2'
 
 jobs:
   validate:
@@ -42,27 +41,23 @@ jobs:
       - name: Validate repository inputs
         run: |
           set -euxo pipefail
-          test -s scripts/install.sh
-          test -s scripts/install-all.sh
-          test -s scripts/install-webui.sh
-          test -s scripts/configure-dfs-root.sh
-          bash -n scripts/install.sh
-          bash -n scripts/install-all.sh
-          bash -n scripts/install-webui.sh
-          bash -n scripts/configure-dfs-root.sh
-          grep -Fq 'SAMBLY_PORT' scripts/install-webui.sh
-          grep -Fq 'cockpit-file-sharing' scripts/install-webui.sh
+          for f in scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh; do
+            test -s "$f"
+            bash -n "$f"
+          done
+          grep -Fq 'rpm -Uvh --test' scripts/install.sh
+          grep -Fq 'SAMBLY_PORT' scripts/install.sh
           grep -Fq 'msdfs root = yes' scripts/configure-dfs-root.sh
+          grep -Fq 'msdfs:' scripts/add-dfs-target.sh
 
   build:
-    name: Full ARM64 offline bundle
+    name: Full minimal ARM64 bundle
     needs: validate
-    # PR updates only run the inexpensive static validation job. The full
-    # dependency download/build is deliberately reserved for a manual run or
-    # a merge/push to main so review iterations do not burn Actions minutes.
+    # PR updates only run the cheap static check. Full package download/build
+    # happens only for workflow_dispatch or after merge/push to main.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -80,41 +75,24 @@ jobs:
           mkdir -p "build/${BUNDLE_NAME}/rpms"
           mkdir -p "build/${BUNDLE_NAME}/webui/sambly"
           mkdir -p "build/${BUNDLE_NAME}/licenses"
-          mkdir -p build/addon-repo
           mkdir -p third_party
 
           cp scripts/install.sh "build/${BUNDLE_NAME}/install.sh"
-          cp scripts/install-all.sh "build/${BUNDLE_NAME}/install-all.sh"
-          cp scripts/install-webui.sh "build/${BUNDLE_NAME}/install-webui.sh"
           cp scripts/configure-dfs-root.sh "build/${BUNDLE_NAME}/configure-dfs-root.sh"
+          cp scripts/add-dfs-target.sh "build/${BUNDLE_NAME}/add-dfs-target.sh"
           chmod +x "build/${BUNDLE_NAME}"/*.sh
 
-      - name: Download cockpit-file-sharing RPM
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euxo pipefail
-          gh release download "$COCKPIT_FS_TAG" \
-            --repo 45Drives/cockpit-file-sharing \
-            --pattern '*el9.noarch.rpm' \
-            --dir build/addon-repo
-          test -n "$(find build/addon-repo -maxdepth 1 -name 'cockpit-file-sharing-*.el9.noarch.rpm' -print -quit)"
-          test "$(find build/addon-repo -maxdepth 1 -name 'cockpit-file-sharing-*.el9.noarch.rpm' | wc -l)" -eq 1
-          ls -lh build/addon-repo/cockpit-file-sharing-*.el9.noarch.rpm
-
-      - name: Download Kylin V10 SP3 ARM64 packages and verify offline dependency closure
+      - name: Download exactly seven official Kylin Samba RPMs
         run: |
           set -euxo pipefail
           docker run --rm --platform linux/arm64 \
             -e BUNDLE_NAME="$BUNDLE_NAME" \
+            -e SAMBA_NEVR="$SAMBA_NEVR" \
             -v "$PWD:/work" \
             -w /work \
             rockylinux:8 \
             bash -euxo pipefail -c '
-              # Minimal Rocky image does not include find/xargs. Install only
-              # the tools actually used below; coreutils-single already provides
-              # the required core utilities in this image.
-              dnf -y install dnf-plugins-core createrepo_c rpm findutils
+              dnf -y install dnf-plugins-core rpm findutils
 
               cat > /etc/yum.repos.d/kylin-offline.repo <<"EOF"
           [kylin-v10sp3-base]
@@ -134,105 +112,71 @@ jobs:
           metadata_expire=0
           EOF
 
-              # Keep the upstream noarch Cockpit add-on in a separate temporary
-              # repo so DNF can resolve every dependency from the Kylin repos.
-              createrepo_c /work/build/addon-repo
-              cat >> /etc/yum.repos.d/kylin-offline.repo <<EOF
-
-          [offline-addons]
-          name=Offline third-party addons
-          baseurl=file:///work/build/addon-repo
-          enabled=1
-          gpgcheck=0
-          metadata_expire=0
-          EOF
-
               dnf clean all
               dnf makecache \
                 --disablerepo="*" \
-                --enablerepo=kylin-v10sp3-base,kylin-v10sp3-updates,offline-addons
+                --enablerepo=kylin-v10sp3-base,kylin-v10sp3-updates
 
-              dnf \
-                --disablerepo="*" \
-                --enablerepo=kylin-v10sp3-base,kylin-v10sp3-updates,offline-addons \
-                --setopt=install_weak_deps=False \
-                download --resolve --alldeps \
-                --destdir=/work/build/${BUNDLE_NAME}/rpms \
-                samba samba-client samba-common samba-common-tools \
-                cockpit cockpit-bridge cockpit-system cockpit-ws \
-                cockpit-file-sharing
+              packages=(
+                samba
+                samba-libs
+                samba-common-tools
+                samba-client
+                samba-common
+                libwbclient
+                libsmbclient
+              )
 
-              test -n "$(find /work/build/${BUNDLE_NAME}/rpms -maxdepth 1 -name "*.rpm" -print -quit)"
-              ls /work/build/${BUNDLE_NAME}/rpms/samba-4.11.12-*.ky10.aarch64.rpm
-              ls /work/build/${BUNDLE_NAME}/rpms/cockpit-file-sharing-*.noarch.rpm
+              for pkg in "${packages[@]}"; do
+                dnf \
+                  --disablerepo="*" \
+                  --enablerepo=kylin-v10sp3-base,kylin-v10sp3-updates \
+                  download \
+                  --destdir="/work/build/${BUNDLE_NAME}/rpms" \
+                  "${pkg}-${SAMBA_NEVR}.aarch64"
+              done
 
-              rm -rf /work/build/${BUNDLE_NAME}/rpms/repodata
-              createrepo_c /work/build/${BUNDLE_NAME}/rpms
+              count="$(find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" | wc -l)"
+              test "$count" -eq 7
 
-              find /work/build/${BUNDLE_NAME}/rpms -maxdepth 1 -name "*.rpm" -print0 \
+              for pkg in "${packages[@]}"; do
+                test -f "/work/build/${BUNDLE_NAME}/rpms/${pkg}-${SAMBA_NEVR}.aarch64.rpm"
+              done
+
+              find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" -print0 \
                 | sort -z \
                 | xargs -0 -r rpm -qp --qf "%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n" \
-                > /work/build/${BUNDLE_NAME}/packages-manifest.txt
+                > "/work/build/${BUNDLE_NAME}/packages-manifest.txt"
 
-              rpm -qpR /work/build/${BUNDLE_NAME}/rpms/cockpit-file-sharing-*.noarch.rpm \
-                > /work/build/${BUNDLE_NAME}/cockpit-file-sharing-requires.txt
-
-              # Re-resolve the same top-level packages using ONLY the generated
-              # local repository. This is the offline-closure proof: a missing
-              # RPM dependency makes this command fail before any artifact ships.
-              cat > /etc/yum.repos.d/offline-verify.repo <<EOF
-          [offline-verify]
-          name=Generated Offline Repository Verification
-          baseurl=file:///work/build/${BUNDLE_NAME}/rpms
-          enabled=1
-          gpgcheck=0
-          metadata_expire=0
-          EOF
-              rm -rf /tmp/offline-verify
-              mkdir -p /tmp/offline-verify
-              dnf clean all
-              dnf makecache --disablerepo="*" --enablerepo=offline-verify
-              dnf \
-                --disablerepo="*" \
-                --enablerepo=offline-verify \
-                --setopt=install_weak_deps=False \
-                download --resolve --alldeps \
-                --destdir=/tmp/offline-verify \
-                samba samba-client samba-common samba-common-tools \
-                cockpit cockpit-bridge cockpit-system cockpit-ws \
-                cockpit-file-sharing
-
-              rm -rf /work/build/addon-repo
+              find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" -print0 \
+                | sort -z \
+                | xargs -0 -r rpm -qpR \
+                > "/work/build/${BUNDLE_NAME}/rpm-requires.txt"
             '
 
-      - name: Validate RPM manifest
+      - name: Validate minimal RPM set
         run: |
           set -euxo pipefail
           manifest="build/${BUNDLE_NAME}/packages-manifest.txt"
-          rpm_dir="build/${BUNDLE_NAME}/rpms"
+          test "$(wc -l < "$manifest")" -eq 7
 
-          test "$(wc -l < "$manifest")" -eq "$(find "$rpm_dir" -maxdepth 1 -type f -name '*.rpm' | wc -l)"
-          grep -Eq '^samba 4\.11\.12-.* aarch64$' "$manifest"
-          grep -Eq '^cockpit-file-sharing 4\.6\.1-2\.el9 noarch$' "$manifest"
+          for pkg in samba samba-libs samba-common-tools samba-client samba-common libwbclient libsmbclient; do
+            grep -Eq "^${pkg} 4\\.11\\.12-32\\.p11\\.ky10 aarch64$" "$manifest"
+          done
 
-          bad_arch="$(awk '$3 != "aarch64" && $3 != "noarch" {print}' "$manifest")"
-          if [[ -n "$bad_arch" ]]; then
-            echo "Unexpected RPM architecture(s):" >&2
-            echo "$bad_arch" >&2
+          if grep -Eq '^(cockpit|python3-samba|samba-dc|samba-help) ' "$manifest"; then
+            echo "Unexpected package in minimal bundle" >&2
+            cat "$manifest" >&2
             exit 1
           fi
 
-          for pkg in attr cockpit-bridge coreutils curl findutils glibc-common hostname iproute nfs-utils python3-botocore samba-common-tools systemd; do
-            grep -q "^${pkg} " "$manifest"
-          done
-
-      - name: Set up Go for Sambly ARM64 build
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22.x'
           cache: false
 
-      - name: Test and build Sambly single binary for ARM64
+      - name: Test and build Sambly static ARM64 binary
         run: |
           set -euxo pipefail
           git clone "$SAMBLY_REPO" third_party/Sambly
@@ -250,7 +194,6 @@ jobs:
 
           chmod +x "build/${BUNDLE_NAME}/webui/sambly/sambly"
           file "build/${BUNDLE_NAME}/webui/sambly/sambly"
-          readelf -h "build/${BUNDLE_NAME}/webui/sambly/sambly" | grep -E 'Class:|Machine:'
           readelf -h "build/${BUNDLE_NAME}/webui/sambly/sambly" | grep -q 'AArch64'
           if readelf -d "build/${BUNDLE_NAME}/webui/sambly/sambly" 2>/dev/null | grep -q '(NEEDED)'; then
             echo 'Sambly binary unexpectedly has dynamic library dependencies.' >&2
@@ -264,80 +207,71 @@ jobs:
             "Build: CGO_ENABLED=0 GOOS=linux GOARCH=arm64" \
             > "build/${BUNDLE_NAME}/webui/sambly/SOURCE.txt"
 
-      - name: Create bundle, checksums, and documentation
+      - name: Create minimal bundle
         run: |
           set -euxo pipefail
           cat > "build/${BUNDLE_NAME}/README.txt" <<EOF
-          Kylin V10 SP3 ARM64 Samba DFS + WebUI Offline Bundle
-          ====================================================
+          Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Minimal Offline Bundle
+          =================================================================
 
-          Target platform:
-            Kylin Linux Advanced Server V10 SP3-2403
-            aarch64 / ARM64
+          Target:
+            Kylin Linux Advanced Server V10 SP3-2403 aarch64
 
-          Included:
-            1. Official Kylin Samba 4.11.12 packages + complete dependency closure
-            2. Official Kylin Cockpit runtime packages + dependency closure
-            3. 45Drives cockpit-file-sharing ${COCKPIT_FS_RELEASE} noarch RPM
-            4. Sambly ARM64 static single binary built from pinned commit ${SAMBLY_COMMIT}
-            5. Offline installers and Samba DFS Root helper
+          This bundle is intentionally tailored to the existing Kylin server
+          baseline and contains exactly seven Samba p11 RPMs, not a complete
+          blank-system dependency closure.
 
-          Recommended install:
-            sudo bash install-all.sh
+          Included Samba RPMs:
+            samba
+            samba-libs
+            samba-common-tools
+            samba-client
+            samba-common
+            libwbclient
+            libsmbclient
 
-          Samba only:
+          Also included:
+            Sambly static ARM64 single binary
+            install.sh
+            configure-dfs-root.sh
+            add-dfs-target.sh
+
+          Install:
             sudo bash install.sh
 
-          WebUI only after Samba is installed:
-            sudo bash install-webui.sh all
-            sudo bash install-webui.sh sambly
-            sudo bash install-webui.sh cockpit
+          The installer first runs rpm -Uvh --test. If this host is missing a
+          dependency, installation stops before changing packages. Do not use
+          --nodeps; collect the reported missing dependency instead.
 
-          Optional DFS Root initialization:
+          Configure this server as DFS Root:
             sudo bash configure-dfs-root.sh
 
-          Web interfaces:
-            Sambly  : http://<server-ip>:8090
-            Cockpit : https://<server-ip>:9090
+          Add a backend:
+            sudo bash add-dfs-target.sh kylin01 192.168.88.211 ledong_share
 
-          Management model:
-            - Sambly edits /etc/samba/smb.conf directly and can create Linux/Samba users and groups.
-            - cockpit-file-sharing manages Samba shares through Samba registry/net conf.
-            - Do not use both UIs to edit the same share definitions at the same time.
-            - For an existing smb.conf/DFS Root, prefer Sambly unless you intentionally migrate
-              the Samba share configuration to registry management.
+          Sambly:
+            http://<server-ip>:8090
 
-          Important:
-            - install scripts do not automatically replace smb.conf.
-            - existing smb.conf shares are NOT automatically imported into Cockpit.
-            - do not use Cockpit Import on a DFS Root until smb.conf is backed up and the
-              registry/include model has been reviewed.
-            - Sambly runs as root; expose port 8090 only to trusted management networks.
-            - The scripts do not automatically open firewall ports 8090 or 9090.
-
-          RPM sources:
-            Kylin official V10 SP3-2403 Base/Updates repositories.
-            cockpit-file-sharing upstream release ${COCKPIT_FS_TAG}.
+          Windows DFS entry:
+            \\\\<server-ip>\\files
           EOF
 
           (
             cd "build/${BUNDLE_NAME}"
-            find rpms -type f -name '*.rpm' -print0 | sort -z | xargs -0 sha256sum
+            find rpms -maxdepth 1 -type f -name '*.rpm' -print0 | sort -z | xargs -0 sha256sum
             sha256sum \
-              install.sh install-all.sh install-webui.sh configure-dfs-root.sh \
-              packages-manifest.txt cockpit-file-sharing-requires.txt README.txt \
+              install.sh configure-dfs-root.sh add-dfs-target.sh \
+              packages-manifest.txt rpm-requires.txt README.txt \
               webui/sambly/sambly webui/sambly/SOURCE.txt licenses/Sambly-LICENSE
           ) > "build/${BUNDLE_NAME}/SHA256SUMS"
 
           tar -C build -czf "build/${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
-          # Write only the basename so `sha256sum -c` works after users download
-          # the two release files into any directory.
           (
             cd build
             sha256sum "${BUNDLE_NAME}.tar.gz" > "${BUNDLE_NAME}.tar.gz.sha256"
           )
 
-      - name: Audit final artifact locally
+      - name: Audit final artifact
         run: |
           set -euxo pipefail
           cd build
@@ -352,20 +286,13 @@ jobs:
             cd "$bundle"
             sha256sum -c SHA256SUMS
             bash -n install.sh
-            bash -n install-all.sh
-            bash -n install-webui.sh
             bash -n configure-dfs-root.sh
+            bash -n add-dfs-target.sh
             test -x webui/sambly/sambly
+            test "$(find rpms -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 7
           )
 
-          test "$(wc -l < "$bundle/packages-manifest.txt")" -eq \
-               "$(find "$bundle/rpms" -maxdepth 1 -type f -name '*.rpm' | wc -l)"
-
-          echo '--- Key packages ---'
-          grep -E '^(samba|cockpit)' "$bundle/packages-manifest.txt" || true
-          echo '--- Sambly binary ---'
-          file "$bundle/webui/sambly/sambly"
-          echo '--- Bundle size ---'
+          readelf -h "$bundle/webui/sambly/sambly" | grep -q 'AArch64'
           du -sh "$bundle" "${BUNDLE_NAME}.tar.gz"
 
       - name: Upload workflow artifact
@@ -379,7 +306,7 @@ jobs:
           retention-days: 14
 
       - name: Publish GitHub Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -393,6 +320,6 @@ jobs:
             gh release create "$RELEASE_TAG" \
               "build/${BUNDLE_NAME}.tar.gz" \
               "build/${BUNDLE_NAME}.tar.gz.sha256" \
-              --title "Kylin V10 SP3 ARM64 Samba DFS + Sambly + Cockpit Offline Bundle" \
-              --notes "Offline bundle for Kylin V10 SP3 aarch64: official Kylin Samba/Cockpit RPM dependency closure, Sambly ARM64 static single binary, 45Drives cockpit-file-sharing, offline installers, DFS helper, manifest and SHA256 checksums."
+              --title "Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Minimal Offline Bundle" \
+              --notes "Minimal native bundle for the target Kylin V10 SP3 aarch64 server: exactly seven official Kylin Samba 4.11.12 p11 RPMs, Sambly static ARM64 Web UI, transaction preflight, DFS Root helper and checksums."
           fi
