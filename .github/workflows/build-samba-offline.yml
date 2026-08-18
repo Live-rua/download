@@ -27,7 +27,7 @@ env:
   RELEASE_TAG: samba-dfs-webui-kylin-v10sp3-aarch64
   SAMBLY_REPO: https://github.com/buadamlaz/Sambly.git
   SAMBLY_COMMIT: 3dab4b2713bc9b4b17f0b903c82600028f44f852
-  COCKPIT_FS_VERSION: '4.6.1'
+  COCKPIT_FS_TAG: v4.6.1-2
   COCKPIT_FS_RELEASE: '4.6.1-2'
 
 jobs:
@@ -68,14 +68,16 @@ jobs:
           chmod +x "build/${BUNDLE_NAME}"/*.sh
 
       - name: Download cockpit-file-sharing RPM
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
-          rpm_name="cockpit-file-sharing-${COCKPIT_FS_RELEASE}.el9.noarch.rpm"
-          url="https://github.com/45Drives/cockpit-file-sharing/releases/download/v${COCKPIT_FS_VERSION}/${rpm_name}"
-          curl -fL --retry 5 --retry-delay 3 \
-            -o "build/${BUNDLE_NAME}/rpms/${rpm_name}" \
-            "$url"
-          test -s "build/${BUNDLE_NAME}/rpms/${rpm_name}"
+          gh release download "$COCKPIT_FS_TAG" \
+            --repo 45Drives/cockpit-file-sharing \
+            --pattern '*el9.noarch.rpm' \
+            --dir "build/${BUNDLE_NAME}/rpms"
+          test -n "$(find "build/${BUNDLE_NAME}/rpms" -maxdepth 1 -name 'cockpit-file-sharing-*.el9.noarch.rpm' -print -quit)"
+          ls -lh "build/${BUNDLE_NAME}/rpms"/cockpit-file-sharing-*.el9.noarch.rpm
 
       - name: Download Kylin V10 SP3 ARM64 packages and full dependency closure
         run: |
@@ -230,7 +232,7 @@ jobs:
 
           RPM sources:
             Kylin official V10 SP3-2403 Base/Updates repositories.
-            cockpit-file-sharing upstream release v${COCKPIT_FS_VERSION}.
+            cockpit-file-sharing upstream release ${COCKPIT_FS_TAG}.
           EOF
 
           (
