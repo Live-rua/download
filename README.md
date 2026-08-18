@@ -24,7 +24,7 @@ kylin-v10sp3-aarch64-samba-dfs-webui-offline/
 │   └── repodata/                 # 本地 DNF/YUM 仓库
 ├── webui/
 │   └── sambly/
-│       ├── sambly                # Linux ARM64 单二进制
+│       ├── sambly                # Linux ARM64 静态单二进制
 │       └── SOURCE.txt
 ├── licenses/
 ├── install.sh                    # 仅安装/升级 Samba
@@ -47,7 +47,7 @@ Samba Server、Client、Common、Common Tools 以及依赖全部从麒麟 V10 SP
 
 ### Sambly
 
-Sambly 是专门管理 Samba 的轻量 Web UI。本 Action 从 `buadamlaz/Sambly` 的固定提交构建 Linux ARM64 单二进制，并放进离线包。
+Sambly 是专门管理 Samba 的轻量 Web UI。本 Action 从 `buadamlaz/Sambly` 的固定提交构建 Linux ARM64 静态单二进制，并放进离线包。
 
 主要用途：
 
@@ -56,7 +56,7 @@ Sambly 是专门管理 Samba 的轻量 Web UI。本 Action 从 `buadamlaz/Sambly
 - 修改 Samba 密码；
 - 新建、修改、删除共享；
 - 配置 `valid users`、`write list`；
-- 图形化调整目录读/写/执行权限；
+- 管理共享目录及常用权限；
 - 编辑和验证 `smb.conf`；
 - 启停/重启 Samba；
 - 操作审计。
@@ -80,7 +80,14 @@ Sambly 是专门管理 Samba 的轻量 Web UI。本 Action 从 `buadamlaz/Sambly
 
 默认地址：`https://<服务器IP>:9090`
 
-**注意：** `cockpit-file-sharing` 的 Samba 页面使用 Samba registry / `net conf` 管理共享。已有 `/etc/samba/smb.conf` 中手工配置的共享不会自动显示；插件提供 Import 功能，但 Import 会改变配置管理方式。因此本离线安装脚本只安装插件，**绝不自动 Import、绝不自动把 DFS Root 配置迁移到 registry**。
+**重要：** `cockpit-file-sharing` 的 Samba 页面使用 Samba registry / `net conf` 管理共享。已有 `/etc/samba/smb.conf` 中手工配置的共享不会自动显示；插件提供 Import 功能，但 Import 会改变配置管理方式。因此本离线安装脚本只安装插件，**绝不自动 Import、绝不自动把 DFS Root 配置迁移到 registry**。
+
+Sambly 与 cockpit-file-sharing 可以同时安装，但不建议同时编辑同一批共享：
+
+- Sambly 直接读写 `/etc/samba/smb.conf`，并且能创建 Linux/Samba 用户和组；
+- cockpit-file-sharing 主要通过 Samba registry / `net conf` 管理共享；
+- 对现有 `smb.conf` 和 DFS Root，默认建议以 **Sambly** 作为 Samba 配置管理 UI；
+- 只有明确决定迁移到 registry 管理时，再使用 Cockpit 的 Import 功能。
 
 ## 安装
 
@@ -126,6 +133,23 @@ sudo SAMBLY_PORT=8090 \
 cat /var/lib/sambly/initial-credentials.txt
 ```
 
+安装脚本不会自动修改防火墙。如果服务器启用了防火墙，需要按现场安全策略放行管理网段访问 Sambly `8090/tcp` 和 Cockpit `9090/tcp`。
+
+## 校验离线包
+
+下载 `.tar.gz` 与 `.tar.gz.sha256` 后先校验外层压缩包：
+
+```bash
+sha256sum -c kylin-v10sp3-aarch64-samba-dfs-webui-offline.tar.gz.sha256
+```
+
+解压后还可以验证包内全部 RPM、脚本和 Sambly 二进制：
+
+```bash
+cd kylin-v10sp3-aarch64-samba-dfs-webui-offline
+sha256sum -c SHA256SUMS
+```
+
 ## 配置 DFS Root
 
 确认 Samba 安装正常后，在作为统一入口的服务器执行：
@@ -169,6 +193,11 @@ Kylin RPM：
 - Sambly: `https://github.com/buadamlaz/Sambly`
 - cockpit-file-sharing: `https://github.com/45Drives/cockpit-file-sharing`
 
-Action 使用 ARM64 容器解析麒麟仓库依赖，不再采用 x86 容器里只设置 `--forcearch=aarch64` 的方式；同时将 `BUNDLE_NAME` 显式传入容器，避免之前工作流中容器内变量不存在导致的构建失败。
+完整构建使用 ARM64 容器解析麒麟仓库依赖，并把 `BUNDLE_NAME` 显式传入容器。生成本地 RPM 仓库后，Action 会关闭所有联网仓库、仅使用刚生成的 `rpms/` 再做一次依赖解析，从而验证离线依赖闭包。
 
-Pull Request 构建只生成 Artifact 做验证；合并到 `main` 后才发布/更新 GitHub Release。
+为避免在 PR 修改过程中反复消耗完整 ARM64 构建时间：
+
+- Pull Request 只运行几秒级的脚本/输入静态检查；
+- 手动 `workflow_dispatch` 才执行完整离线包构建，但不会发布 Release；
+- 合并/推送到 `main` 执行完整构建，通过后发布或更新 GitHub Release；
+- 正式打包前还会再次解压生成的 `.tar.gz`，校验外层 SHA256、包内 `SHA256SUMS`、脚本语法、RPM 数量和 Sambly ARM64 二进制。
