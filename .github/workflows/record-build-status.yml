@@ -1,15 +1,15 @@
 name: Record full bundle build status
 
 on:
-  workflow_run:
-    workflows:
-      - Build Kylin Samba + Sambly Full Offline Bundle
-    types:
-      - requested
-      - in_progress
-      - completed
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-samba-offline.yml'
+      - 'scripts/**'
+      - 'README.md'
 
 permissions:
+  actions: read
   contents: write
 
 env:
@@ -18,7 +18,6 @@ env:
 
 jobs:
   record:
-    if: github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
@@ -26,25 +25,47 @@ jobs:
         with:
           ref: main
 
-      - name: Record workflow run
+      - name: Locate and record bundle workflow run
         env:
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
-          STATUS: ${{ github.event.workflow_run.status }}
-          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
+
+          run_json=''
+          for _ in $(seq 1 20); do
+            run_json="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow build-samba-offline.yml \
+              --commit "$GITHUB_SHA" \
+              --event push \
+              --limit 5 \
+              --json databaseId,number,status,conclusion,url,headSha \
+              --jq '.[0] // empty')"
+            [[ -n "$run_json" ]] && break
+            sleep 3
+          done
+
+          if [[ -z "$run_json" ]]; then
+            echo '未找到对应的主构建 workflow run。' >&2
+            exit 1
+          fi
+
+          run_id="$(jq -r '.databaseId' <<<"$run_json")"
+          run_number="$(jq -r '.number' <<<"$run_json")"
+          status="$(jq -r '.status' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion // ""' <<<"$run_json")"
+          head_sha="$(jq -r '.headSha' <<<"$run_json")"
+          run_url="$(jq -r '.url' <<<"$run_json")"
+
           mkdir -p .build-status
           cat > .build-status/latest.txt <<EOF
           workflow=Build Kylin Samba + Sambly Full Offline Bundle
-          run_id=${RUN_ID}
-          run_number=${RUN_NUMBER}
-          status=${STATUS}
-          conclusion=${CONCLUSION}
-          head_sha=${HEAD_SHA}
-          run_url=${RUN_URL}
+          run_id=${run_id}
+          run_number=${run_number}
+          status=${status}
+          conclusion=${conclusion}
+          head_sha=${head_sha}
+          run_url=${run_url}
           release_tag=${RELEASE_TAG}
           bundle=${BUNDLE_NAME}.tar.gz
           checksum=${BUNDLE_NAME}.tar.gz.sha256
@@ -53,9 +74,6 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .build-status/latest.txt
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-          git commit -m 'chore: record full bundle build status [skip ci]'
+          git commit -m 'chore: record full bundle build run [skip ci]'
           git pull --rebase origin main
           git push origin HEAD:main
