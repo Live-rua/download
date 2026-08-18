@@ -48,12 +48,12 @@ EXPECTED_PACKAGES=(
 
 rpm_files=()
 for pkg in "${EXPECTED_PACKAGES[@]}"; do
-  matches=("$RPM_DIR/${pkg}-${EXPECTED_VERSION}.aarch64.rpm")
-  if [[ ! -f "${matches[0]}" ]]; then
+  rpm_path="$RPM_DIR/${pkg}-${EXPECTED_VERSION}.aarch64.rpm"
+  if [[ ! -f "$rpm_path" ]]; then
     echo "错误：缺少 ${pkg}-${EXPECTED_VERSION}.aarch64.rpm" >&2
     exit 1
   fi
-  rpm_files+=("${matches[0]}")
+  rpm_files+=("$rpm_path")
 done
 
 actual_count="$(find "$RPM_DIR" -maxdepth 1 -type f -name '*.rpm' | wc -l)"
@@ -106,7 +106,11 @@ echo "== Samba 安装验证 =="
 command -v smbd
 command -v testparm
 smbd -V
-testparm -s >/dev/null
+if [[ -f /etc/samba/smb.conf ]]; then
+  testparm -s /etc/samba/smb.conf >/dev/null
+else
+  echo "提示：当前还没有 /etc/samba/smb.conf；configure-dfs-root.sh 会创建 DFS 配置。"
+fi
 rpm -qa | grep -E '^(samba|libwbclient|libsmbclient)' | sort
 
 # Sambly 上游使用 smbd.service 控制 Samba；Kylin/RHEL RPM 通常提供 smb.service。
