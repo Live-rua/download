@@ -1,0 +1,191 @@
+name: Orchestrate verified full offline release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/orchestrate-full-release.yml'
+
+permissions:
+  actions: write
+  contents: write
+
+env:
+  BUILD_WORKFLOW: build-samba-offline.yml
+  BUNDLE_NAME: kylin-v10sp3-aarch64-samba-sambly-full
+  RELEASE_TAG: samba-sambly-kylin-v10sp3-aarch64-full
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Clear stale Samba build queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          ids="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow "$BUILD_WORKFLOW" \
+            --limit 100 \
+            --json databaseId,status \
+            --jq '.[] | select(.status != "completed") | .databaseId')"
+          for id in $ids; do
+            echo "Cancelling stale build run $id"
+            gh run cancel "$id" --repo "$GITHUB_REPOSITORY" || true
+          done
+
+          for _ in $(seq 1 30); do
+            active="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$BUILD_WORKFLOW" \
+              --limit 100 \
+              --json status \
+              --jq '[.[] | select(.status != "completed")] | length')"
+            [[ "$active" = "0" ]] && exit 0
+            sleep 2
+          done
+          echo '旧构建仍未全部退出。' >&2
+          exit 1
+
+      - name: Dispatch clean full build
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh workflow run "$BUILD_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main
+
+          full_run_id=''
+          for _ in $(seq 1 30); do
+            full_run_id="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$BUILD_WORKFLOW" \
+              --event workflow_dispatch \
+              --branch main \
+              --limit 20 \
+              --json databaseId,headSha \
+              --jq '.[] | select(.headSha == "'"$GITHUB_SHA"'") | .databaseId' \
+              | head -n1)"
+            [[ -n "$full_run_id" ]] && break
+            sleep 2
+          done
+
+          if [[ -z "$full_run_id" ]]; then
+            echo '未找到刚触发的完整构建。' >&2
+            exit 1
+          fi
+          echo "full_run_id=$full_run_id" >> "$GITHUB_OUTPUT"
+          echo "Full build run: $full_run_id"
+
+      - name: Record full build run ID
+        env:
+          FULL_RUN_ID: ${{ steps.dispatch.outputs.full_run_id }}
+        run: |
+          set -euxo pipefail
+          mkdir -p .build-status
+          cat > .build-status/latest.txt <<EOF
+          workflow=Build Kylin Samba + Sambly Full Offline Bundle
+          run_id=${FULL_RUN_ID}
+          status=dispatched
+          conclusion=
+          head_sha=${GITHUB_SHA}
+          run_url=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FULL_RUN_ID}
+          orchestrator_run_id=${GITHUB_RUN_ID}
+          release_tag=${RELEASE_TAG}
+          bundle=${BUNDLE_NAME}.tar.gz
+          checksum=${BUNDLE_NAME}.tar.gz.sha256
+          EOF
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .build-status/latest.txt
+          git commit -m 'chore: record dispatched full bundle run [skip ci]'
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Wait for verified full build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FULL_RUN_ID: ${{ steps.dispatch.outputs.full_run_id }}
+        run: |
+          set -euxo pipefail
+          gh run watch "$FULL_RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status --interval 10
+
+      - name: Download and verify workflow artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FULL_RUN_ID: ${{ steps.dispatch.outputs.full_run_id }}
+        run: |
+          set -euxo pipefail
+          rm -rf release-assets
+          mkdir -p release-assets
+          gh run download "$FULL_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$BUNDLE_NAME" \
+            --dir release-assets
+
+          test -s "release-assets/${BUNDLE_NAME}.tar.gz"
+          test -s "release-assets/${BUNDLE_NAME}.tar.gz.sha256"
+          (cd release-assets && sha256sum -c "${BUNDLE_NAME}.tar.gz.sha256")
+
+      - name: Publish verified GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FULL_RUN_ID: ${{ steps.dispatch.outputs.full_run_id }}
+        run: |
+          set -euxo pipefail
+          notes="Verified full offline bundle for Kylin V10 SP3-2403 aarch64. Samba 4.11.12-32.p11 and its recursively resolved strong dependency closure were validated in an empty offline installroot. Source build run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FULL_RUN_ID}"
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "release-assets/${BUNDLE_NAME}.tar.gz" \
+              "release-assets/${BUNDLE_NAME}.tar.gz.sha256" \
+              --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title 'Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Full Offline Bundle' \
+              --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" \
+              "release-assets/${BUNDLE_NAME}.tar.gz" \
+              "release-assets/${BUNDLE_NAME}.tar.gz.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title 'Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Full Offline Bundle' \
+              --notes "$notes"
+          fi
+
+      - name: Record successful Release
+        if: success()
+        env:
+          FULL_RUN_ID: ${{ steps.dispatch.outputs.full_run_id }}
+        run: |
+          set -euxo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          mkdir -p .build-status
+          cat > .build-status/latest.txt <<EOF
+          workflow=Build Kylin Samba + Sambly Full Offline Bundle
+          run_id=${FULL_RUN_ID}
+          status=completed
+          conclusion=success
+          head_sha=${GITHUB_SHA}
+          run_url=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${FULL_RUN_ID}
+          orchestrator_run_id=${GITHUB_RUN_ID}
+          release_tag=${RELEASE_TAG}
+          bundle=${BUNDLE_NAME}.tar.gz
+          checksum=${BUNDLE_NAME}.tar.gz.sha256
+          release_published=yes
+          EOF
+          git add .build-status/latest.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: record verified full bundle release [skip ci]'
+          git push origin HEAD:main
