@@ -91,7 +91,7 @@ jobs:
             -w /work \
             rockylinux:8 \
             bash -euxo pipefail -c '
-              dnf -y install dnf-plugins-core createrepo_c rpm
+              dnf -y install dnf-plugins-core createrepo_c rpm findutils coreutils
 
               cat > /etc/yum.repos.d/kylin-offline.repo <<"EOF"
           [kylin-v10sp3-base]
