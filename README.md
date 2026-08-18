@@ -1,203 +1,225 @@
-# Kylin V10 SP3 ARM64 Samba DFS + WebUI 离线包
+# Kylin V10 SP3 ARM64 Samba 4.11 + Sambly 最小离线包
 
-本仓库通过 GitHub Actions 为 **Kylin Linux Advanced Server V10 SP3-2403 aarch64** 构建一套可直接带入离线环境的 Samba 文件服务工具包。
+这个仓库现在只针对当前确定的部署方式：
 
-目标场景：
+**新麒麟 ARM 服务器原生部署 Samba 4.11 + Sambly，并作为 Samba DFS 统一入口。**
 
-- 多台麒麟 ARM 服务器运行 Samba 4.x；
-- 一台 Samba DFS Root 作为 Windows 的统一入口；
-- Windows 只添加一个网络位置，例如 `\\files-gw\\files`；
-- 管理员希望通过 Web UI 管理 Samba 用户、组、共享目录和权限；
-- 服务器无法访问互联网，因此安装介质必须包含完整依赖。
+不使用 Docker，不在默认包里安装 Cockpit，也不下载“空白系统完整依赖闭包”。
+
+## 目标服务器
+
+已确认的目标环境：
+
+```text
+Kylin Linux Advanced Server V10 (Halberd)
+Kernel: 4.19.90-52.60.v2207.ky10.aarch64
+Architecture: aarch64
+
+现有：
+samba-client-4.11.12-32.p03.ky10.aarch64
+samba-common-4.11.12-32.p03.ky10.aarch64
+libldb-2.0.12-4.ky10.aarch64
+libtalloc-2.3.1-1.ky10.aarch64
+libtdb-1.4.2-7.ky10.aarch64
+libtevent-0.10.2-1.ky10.aarch64
+libwbclient-4.11.12-32.p03.ky10.aarch64
+libsmbclient-4.11.12-32.p03.ky10.aarch64
+```
+
+因此 Release 不再携带几百个系统 RPM，而只补齐/统一升级当前 Samba 组件。
 
 ## Release 内容
 
-生成的压缩包：
-
-`kylin-v10sp3-aarch64-samba-dfs-webui-offline.tar.gz`
-
-目录结构：
+生成：
 
 ```text
-kylin-v10sp3-aarch64-samba-dfs-webui-offline/
-├── rpms/                         # Samba/Cockpit/插件及完整 RPM 依赖闭包
-│   └── repodata/                 # 本地 DNF/YUM 仓库
+kylin-v10sp3-aarch64-samba-sambly-minimal.tar.gz
+kylin-v10sp3-aarch64-samba-sambly-minimal.tar.gz.sha256
+```
+
+包内：
+
+```text
+kylin-v10sp3-aarch64-samba-sambly-minimal/
+├── rpms/
+│   ├── samba-4.11.12-32.p11.ky10.aarch64.rpm
+│   ├── samba-libs-4.11.12-32.p11.ky10.aarch64.rpm
+│   ├── samba-common-tools-4.11.12-32.p11.ky10.aarch64.rpm
+│   ├── samba-client-4.11.12-32.p11.ky10.aarch64.rpm
+│   ├── samba-common-4.11.12-32.p11.ky10.aarch64.rpm
+│   ├── libwbclient-4.11.12-32.p11.ky10.aarch64.rpm
+│   └── libsmbclient-4.11.12-32.p11.ky10.aarch64.rpm
 ├── webui/
 │   └── sambly/
-│       ├── sambly                # Linux ARM64 静态单二进制
+│       ├── sambly
 │       └── SOURCE.txt
 ├── licenses/
-├── install.sh                    # 仅安装/升级 Samba
-├── install-webui.sh              # 安装 Sambly / Cockpit
-├── install-all.sh                # Samba + 两套 WebUI 一键安装
-├── configure-dfs-root.sh         # DFS Root 初始化助手
+├── install.sh
+├── configure-dfs-root.sh
+├── add-dfs-target.sh
 ├── packages-manifest.txt
-├── cockpit-file-sharing-requires.txt
+├── rpm-requires.txt
 ├── SHA256SUMS
 └── README.txt
 ```
 
-## 包含的软件
+RPM 均从麒麟 V10 SP3-2403 官方 ARM64 Base / Updates 仓库获取。Sambly 从固定 commit 构建为 Linux ARM64 静态单二进制。
 
-### Samba 4.x
+## 为什么只有 7 个 RPM
 
-Samba Server、Client、Common、Common Tools 以及依赖全部从麒麟 V10 SP3-2403 官方 Base / Updates ARM64 仓库解析下载。
+这不是给“完全空白系统”准备的通用安装介质，而是针对上面已经确认过的这台麒麟服务器。
 
-安装脚本不会自动替换现有 `/etc/samba/smb.conf`，也不会自动把普通服务器改成 DFS Root。
+当前系统已经存在 Samba 所需的大量基础库，所以只需要：
 
-### Sambly
+1. 安装 Samba Server；
+2. 补上 `samba-libs`、`samba-common-tools`；
+3. 把现有 p03 的 Samba Client/Common/libwbclient/libsmbclient 一起升级到 p11，避免同一套 Samba 组件混用不同 patch release。
 
-Sambly 是专门管理 Samba 的轻量 Web UI。本 Action 从 `buadamlaz/Sambly` 的固定提交构建 Linux ARM64 静态单二进制，并放进离线包。
+安装脚本不会盲目强装。正式修改系统前会先执行：
 
-主要用途：
+```bash
+rpm -Uvh --test rpms/*.rpm
+```
 
-- 新建、删除、启用/禁用 Samba 用户；
-- 创建 Linux 用户和组、调整组成员；
-- 修改 Samba 密码；
-- 新建、修改、删除共享；
-- 配置 `valid users`、`write list`；
-- 管理共享目录及常用权限；
-- 编辑和验证 `smb.conf`；
-- 启停/重启 Samba；
-- 操作审计。
-
-默认地址：`http://<服务器IP>:8090`
-
-> Sambly 以 root 身份运行，只应开放给可信内网管理网段，不应暴露到公网。
-
-### Cockpit + cockpit-file-sharing
-
-同时打包麒麟官方 Cockpit 运行组件，以及 45Drives 的 `cockpit-file-sharing` 插件。
-
-主要用途：
-
-- Cockpit 系统原生 Web 管理控制台；
-- Samba 全局参数管理；
-- Samba 用户密码管理；
-- Samba/NFS 共享管理；
-- 共享目录权限管理；
-- 服务和系统状态管理。
-
-默认地址：`https://<服务器IP>:9090`
-
-**重要：** `cockpit-file-sharing` 的 Samba 页面使用 Samba registry / `net conf` 管理共享。已有 `/etc/samba/smb.conf` 中手工配置的共享不会自动显示；插件提供 Import 功能，但 Import 会改变配置管理方式。因此本离线安装脚本只安装插件，**绝不自动 Import、绝不自动把 DFS Root 配置迁移到 registry**。
-
-Sambly 与 cockpit-file-sharing 可以同时安装，但不建议同时编辑同一批共享：
-
-- Sambly 直接读写 `/etc/samba/smb.conf`，并且能创建 Linux/Samba 用户和组；
-- cockpit-file-sharing 主要通过 Samba registry / `net conf` 管理共享；
-- 对现有 `smb.conf` 和 DFS Root，默认建议以 **Sambly** 作为 Samba 配置管理 UI；
-- 只有明确决定迁移到 registry 管理时，再使用 Cockpit 的 Import 功能。
+只有依赖预检查成功才继续安装。如果另一台麒麟缺依赖，脚本会停止，并要求根据实际缺失项补包；**不要使用 `--nodeps`**。
 
 ## 安装
 
-推荐全部安装：
+先校验：
 
 ```bash
-tar -xzf kylin-v10sp3-aarch64-samba-dfs-webui-offline.tar.gz
-cd kylin-v10sp3-aarch64-samba-dfs-webui-offline
-sudo bash install-all.sh
+sha256sum -c kylin-v10sp3-aarch64-samba-sambly-minimal.tar.gz.sha256
 ```
 
-仅安装 Samba：
+解压：
+
+```bash
+tar -xzf kylin-v10sp3-aarch64-samba-sambly-minimal.tar.gz
+cd kylin-v10sp3-aarch64-samba-sambly-minimal
+```
+
+安装 Samba + Sambly：
 
 ```bash
 sudo bash install.sh
 ```
 
-仅安装 Web UI：
+如果希望预先指定 Sambly 管理员密码：
 
 ```bash
-sudo bash install-webui.sh all
-```
-
-也可以单独安装：
-
-```bash
-sudo bash install-webui.sh sambly
-sudo bash install-webui.sh cockpit
-```
-
-Sambly 支持通过环境变量进行无交互初始化：
-
-```bash
-sudo SAMBLY_PORT=8090 \
-     SAMBLY_ADMIN_USER=admin \
+sudo SAMBLY_ADMIN_USER=admin \
      SAMBLY_ADMIN_PASSWORD='替换成强密码' \
-     bash install-webui.sh sambly
+     SAMBLY_PORT=8090 \
+     bash install.sh
 ```
 
-如果不设置 `SAMBLY_ADMIN_PASSWORD`，首次启动由 Sambly 生成随机密码，可在下面文件查看：
+不提供密码时，由 Sambly 首次启动生成随机密码：
 
 ```bash
 cat /var/lib/sambly/initial-credentials.txt
 ```
 
-安装脚本不会自动修改防火墙。如果服务器启用了防火墙，需要按现场安全策略放行管理网段访问 Sambly `8090/tcp` 和 Cockpit `9090/tcp`。
+Sambly 默认：
 
-## 校验离线包
-
-下载 `.tar.gz` 与 `.tar.gz.sha256` 后先校验外层压缩包：
-
-```bash
-sha256sum -c kylin-v10sp3-aarch64-samba-dfs-webui-offline.tar.gz.sha256
+```text
+http://<服务器IP>:8090
 ```
 
-解压后还可以验证包内全部 RPM、脚本和 Sambly 二进制：
+Sambly 以 root 身份运行，用于管理 Samba 用户、Linux 用户/组、共享以及 `/etc/samba/smb.conf`。8090 只应开放给可信管理网络。
 
-```bash
-cd kylin-v10sp3-aarch64-samba-dfs-webui-offline
-sha256sum -c SHA256SUMS
-```
+`install.sh` **不会启动 Samba，也不会自动把服务器改成 DFS Root**，避免在配置完成前开放文件共享。
 
-## 配置 DFS Root
+## 配置 DFS 入口
 
-确认 Samba 安装正常后，在作为统一入口的服务器执行：
+确认 Sambly 能访问后，执行：
 
 ```bash
 sudo bash configure-dfs-root.sh
 ```
 
-它会：
+脚本会：
 
-1. 备份已有 `/etc/samba/smb.conf`；
-2. 创建 `/srv/dfs`；
-3. 配置 `[files]` 为 `msdfs root = yes`；
-4. 使用 `testparm` 验证配置；
-5. 给出后端 DFS 链接示例。
+- 备份原 `/etc/samba/smb.conf`；
+- 若发现已有自定义业务共享则默认停止，避免覆盖；
+- 创建 `/srv/dfs`；
+- 开启 `host msdfs = yes`；
+- 创建 `[files]`，设置 `msdfs root = yes`；
+- 设置最低协议为 SMB2；
+- `testparm` 成功后才替换正式配置；
+- 启动并启用 `smb.service`。
 
-例如：
+然后先在 Sambly 中创建至少一个 Samba 用户。
 
-```bash
-cd /srv/dfs
-ln -s 'msdfs:kylin01\\ledong_share' kylin01
-ln -s 'msdfs:kylin02\\ledong_share' kylin02
-ln -s 'msdfs:kylin03\\ledong_share' kylin03
+## 添加后端麒麟服务器
+
+例如后端服务器：
+
+```text
+192.168.88.211 -> ledong_share
+192.168.88.212 -> ledong_share
+192.168.88.213 -> ledong_share
 ```
 
-Windows 最终访问：
+执行：
+
+```bash
+sudo bash add-dfs-target.sh kylin01 192.168.88.211 ledong_share
+sudo bash add-dfs-target.sh kylin02 192.168.88.212 ledong_share
+sudo bash add-dfs-target.sh kylin03 192.168.88.213 ledong_share
+```
+
+最终 `/srv/dfs` 类似：
+
+```text
+kylin01 -> msdfs:192.168.88.211\ledong_share
+kylin02 -> msdfs:192.168.88.212\ledong_share
+kylin03 -> msdfs:192.168.88.213\ledong_share
+```
+
+Windows 只添加：
 
 ```text
 \\<DFS服务器IP>\files
 ```
 
-## 软件来源与构建方式
+就会看到：
 
-Kylin RPM：
+```text
+kylin01
+kylin02
+kylin03
+```
 
-- Base: `https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/base/aarch64/`
-- Updates: `https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/updates/aarch64/`
+文件真正传输时，Windows 会根据 DFS referral 直接连接相应后端服务器，所以 DFS 入口不需要大容量业务磁盘，也不承担所有文件传输流量。
 
-第三方开源组件：
+## Cockpit / cockpit-file-sharing
 
-- Sambly: `https://github.com/buadamlaz/Sambly`
-- cockpit-file-sharing: `https://github.com/45Drives/cockpit-file-sharing`
+当前这台新服务器的确定方案是 **Samba 4.11 + Sambly 原生部署**，因此 Cockpit 已从默认 Release 中拆除，避免为了一个备用 UI 携带数百个额外系统依赖。
 
-完整构建使用 ARM64 容器解析麒麟仓库依赖，并把 `BUNDLE_NAME` 显式传入容器。生成本地 RPM 仓库后，Action 会关闭所有联网仓库、仅使用刚生成的 `rpms/` 再做一次依赖解析，从而验证离线依赖闭包。
+如果后续仍需要 Cockpit + cockpit-file-sharing，应作为**独立可选安装包**构建，不与这个最小包绑定，也不应默认修改 DFS 的 `smb.conf` 管理方式。
 
-为避免在 PR 修改过程中反复消耗完整 ARM64 构建时间：
+## Action 策略
 
-- Pull Request 只运行几秒级的脚本/输入静态检查；
-- 手动 `workflow_dispatch` 才执行完整离线包构建，但不会发布 Release；
-- 合并/推送到 `main` 执行完整构建，通过后发布或更新 GitHub Release；
-- 正式打包前还会再次解压生成的 `.tar.gz`，校验外层 SHA256、包内 `SHA256SUMS`、脚本语法、RPM 数量和 Sambly ARM64 二进制。
+为了避免浪费 GitHub Actions 时间：
+
+- PR 只运行几秒的 shell 静态检查；
+- 完整 ARM64 构建只在手动 `workflow_dispatch` 或合并到 `main` 后执行；
+- 完整构建只下载上述 7 个麒麟官方 Samba RPM；
+- Sambly 会运行 upstream tests 后再交叉编译 ARM64 静态二进制；
+- 最终 tar.gz 会重新解压并校验 SHA256、脚本语法、RPM 数量和 Sambly 架构；
+- 只有 `main` push 的完整构建成功后才发布/更新 Release。
+
+## 软件来源
+
+Kylin 官方仓库：
+
+```text
+https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/base/aarch64/
+https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/updates/aarch64/
+```
+
+Sambly：
+
+```text
+https://github.com/buadamlaz/Sambly
+```
