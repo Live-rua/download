@@ -1,0 +1,157 @@
+name: Build Kylin Samba Offline Bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-samba-offline.yml'
+      - 'scripts/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: samba-offline-release
+  cancel-in-progress: false
+
+env:
+  BUNDLE_NAME: kylin-v10sp3-aarch64-samba-4.11.12-p11-offline
+  RELEASE_TAG: samba-kylin-v10sp3-aarch64-4.11.12-p11
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare bundle directories
+        run: |
+          set -euxo pipefail
+          rm -rf build
+          mkdir -p "build/${BUNDLE_NAME}/rpms"
+          cp scripts/install.sh "build/${BUNDLE_NAME}/install.sh"
+          cp scripts/configure-dfs-root.sh "build/${BUNDLE_NAME}/configure-dfs-root.sh"
+          chmod +x "build/${BUNDLE_NAME}/install.sh" "build/${BUNDLE_NAME}/configure-dfs-root.sh"
+
+      - name: Download Kylin V10 SP3 aarch64 Samba and full dependency closure
+        run: |
+          set -euxo pipefail
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            rockylinux:8 \
+            bash -euxo pipefail -c '
+              dnf -y install dnf-plugins-core createrepo_c rpm
+
+              cat > /etc/yum.repos.d/kylin-samba.repo <<"EOF"
+          [kylin-v10sp3-base]
+          name=Kylin V10 SP3 2403 Base aarch64
+          baseurl=https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/base/aarch64/
+          enabled=1
+          gpgcheck=0
+          metadata_expire=0
+
+          [kylin-v10sp3-updates]
+          name=Kylin V10 SP3 2403 Updates aarch64
+          baseurl=https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/updates/aarch64/
+          enabled=1
+          gpgcheck=0
+          metadata_expire=0
+          EOF
+
+              # Disable Rocky repositories during dependency solving so every target RPM
+              # comes from the matching Kylin V10 SP3 repository.
+              dnf --forcearch=aarch64 \
+                --disablerepo="*" \
+                --enablerepo=kylin-v10sp3-base,kylin-v10sp3-updates \
+                --setopt=install_weak_deps=False \
+                download --resolve --alldeps \
+                --destdir=/work/build/${BUNDLE_NAME}/rpms \
+                samba samba-client samba-common samba-common-tools
+
+              test -n "$(find /work/build/${BUNDLE_NAME}/rpms -maxdepth 1 -name "*.rpm" -print -quit)"
+
+              # Ensure the release contains the Samba server package and matching p11 line.
+              ls /work/build/${BUNDLE_NAME}/rpms/samba-4.11.12-32.p11.ky10.aarch64.rpm
+
+              createrepo_c /work/build/${BUNDLE_NAME}/rpms
+
+              find /work/build/${BUNDLE_NAME}/rpms -maxdepth 1 -name "*.rpm" -print0 \
+                | sort -z \
+                | xargs -0 -r rpm -qp --qf "%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n" \
+                > /work/build/${BUNDLE_NAME}/packages-manifest.txt
+            '
+
+      - name: Add bundle metadata and checksums
+        run: |
+          set -euxo pipefail
+          cat > "build/${BUNDLE_NAME}/README.txt" <<'EOF'
+          Kylin V10 SP3 ARM64 Samba Offline Bundle
+          ========================================
+
+          Target:
+            Kylin Linux Advanced Server V10 SP3-2403
+            aarch64 / ARM64
+            Samba 4.11.12-32.p11.ky10
+
+          Install:
+            sudo bash install.sh
+
+          The installer:
+            - uses only the included local RPM repository;
+            - installs/upgrades samba, samba-client, samba-common and samba-common-tools;
+            - does not overwrite /etc/samba/smb.conf;
+            - does not automatically start Samba.
+
+          Optional DFS root initialization:
+            sudo bash configure-dfs-root.sh
+
+          RPM source:
+            Kylin official Base and Updates repositories under update.cs2c.com.cn.
+          EOF
+
+          (
+            cd "build/${BUNDLE_NAME}"
+            find rpms -type f -name '*.rpm' -print0 | sort -z | xargs -0 sha256sum
+            sha256sum install.sh configure-dfs-root.sh packages-manifest.txt README.txt
+          ) > "build/${BUNDLE_NAME}/SHA256SUMS"
+
+          tar -C build -czf "build/${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
+          sha256sum "build/${BUNDLE_NAME}.tar.gz" > "build/${BUNDLE_NAME}.tar.gz.sha256"
+
+          echo '--- Samba packages ---'
+          grep '^samba ' "build/${BUNDLE_NAME}/packages-manifest.txt" || true
+          echo '--- Bundle size ---'
+          du -sh "build/${BUNDLE_NAME}" "build/${BUNDLE_NAME}.tar.gz"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE_NAME }}
+          path: |
+            build/${{ env.BUNDLE_NAME }}.tar.gz
+            build/${{ env.BUNDLE_NAME }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "build/${BUNDLE_NAME}.tar.gz" \
+              "build/${BUNDLE_NAME}.tar.gz.sha256" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "build/${BUNDLE_NAME}.tar.gz" \
+              "build/${BUNDLE_NAME}.tar.gz.sha256" \
+              --title "Kylin V10 SP3 ARM64 Samba 4.11.12 p11 Offline Bundle" \
+              --notes "Official Kylin V10 SP3-2403 aarch64 Samba 4.11.12-32.p11 RPMs with the resolved dependency closure, local-repository metadata, offline installer, DFS root helper, manifest and SHA256 checksums."
+          fi
