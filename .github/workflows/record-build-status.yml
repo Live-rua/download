@@ -5,6 +5,8 @@ on:
     workflows:
       - Build Kylin Samba + Sambly Full Offline Bundle
     types:
+      - requested
+      - in_progress
       - completed
 
 permissions:
@@ -24,10 +26,11 @@ jobs:
         with:
           ref: main
 
-      - name: Record completed run
+      - name: Record workflow run
         env:
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          STATUS: ${{ github.event.workflow_run.status }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
@@ -38,6 +41,7 @@ jobs:
           workflow=Build Kylin Samba + Sambly Full Offline Bundle
           run_id=${RUN_ID}
           run_number=${RUN_NUMBER}
+          status=${STATUS}
           conclusion=${CONCLUSION}
           head_sha=${HEAD_SHA}
           run_url=${RUN_URL}
@@ -53,4 +57,5 @@ jobs:
             exit 0
           fi
           git commit -m 'chore: record full bundle build status [skip ci]'
+          git pull --rebase origin main
           git push origin HEAD:main
