@@ -1,10 +1,11 @@
 workflow=Build Kylin Samba + Sambly Full Offline Bundle
 run_id=32121533319
-status=dispatched
-conclusion=
+status=completed
+conclusion=success
 head_sha=4a8c963fd8c7a0b89888cfed91693a290209ec5d
 run_url=https://github.com/Live-rua/download/actions/runs/32121533319
 orchestrator_run_id=32121505095
 release_tag=samba-sambly-kylin-v10sp3-aarch64-full
 bundle=kylin-v10sp3-aarch64-samba-sambly-full.tar.gz
 checksum=kylin-v10sp3-aarch64-samba-sambly-full.tar.gz.sha256
+release_published=yes
