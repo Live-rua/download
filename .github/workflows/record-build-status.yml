@@ -1,0 +1,56 @@
+name: Record full bundle build status
+
+on:
+  workflow_run:
+    workflows:
+      - Build Kylin Samba + Sambly Full Offline Bundle
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: samba-sambly-kylin-v10sp3-aarch64-full
+  BUNDLE_NAME: kylin-v10sp3-aarch64-samba-sambly-full
+
+jobs:
+  record:
+    if: github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Record completed run
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euxo pipefail
+          mkdir -p .build-status
+          cat > .build-status/latest.txt <<EOF
+          workflow=Build Kylin Samba + Sambly Full Offline Bundle
+          run_id=${RUN_ID}
+          run_number=${RUN_NUMBER}
+          conclusion=${CONCLUSION}
+          head_sha=${HEAD_SHA}
+          run_url=${RUN_URL}
+          release_tag=${RELEASE_TAG}
+          bundle=${BUNDLE_NAME}.tar.gz
+          checksum=${BUNDLE_NAME}.tar.gz.sha256
+          EOF
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .build-status/latest.txt
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'chore: record full bundle build status [skip ci]'
+          git push origin HEAD:main
