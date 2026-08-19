@@ -17,7 +17,8 @@ curl --fail --location --retry 3 --retry-delay 2 \
   -o "$STATIC_DIR/htmx.min.js"
 curl --fail --location --retry 3 --retry-delay 2 \
   "https://cdn.jsdelivr.net/npm/alpinejs@${ALPINE_VERSION}/dist/cdn.min.js" \
-  -o "$STATIC_DIR/alpine.min.js"\n
+  -o "$STATIC_DIR/alpine.min.js"
+
 test "$(wc -c < "$STATIC_DIR/htmx.min.js")" -gt 10000
 test "$(wc -c < "$STATIC_DIR/alpine.min.js")" -gt 10000
 
