@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+用法：
+  sudo bash install.sh
+  sudo bash install.sh --dry-run
+
+--dry-run  只校验离线包并执行 DNF/YUM 事务测试，显示将安装/升级的包；
+           不安装/升级任何 RPM，不写 Samba 配置，不安装或启动 Sambly。
+EOF
+}
+
+DRY_RUN=0
+case "${1:-}" in
+  "") ;;
+  --dry-run) DRY_RUN=1 ;;
+  -h|--help) usage; exit 0 ;;
+  *)
+    echo "错误：未知参数：$1" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
+if [[ $# -gt 1 ]]; then
+  echo "错误：参数过多。" >&2
+  usage >&2
+  exit 1
+fi
+
 if [[ ${EUID} -ne 0 ]]; then
   echo "请使用 root 运行：sudo bash install.sh" >&2
   exit 1
@@ -54,23 +82,14 @@ if [[ -f "$ROOT_DIR/SHA256SUMS" ]]; then
   (cd "$ROOT_DIR" && sha256sum -c SHA256SUMS)
 fi
 
-BACKUP_DIR="/root/samba-sambly-backup-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-rpm -qa | sort > "$BACKUP_DIR/packages-before-all.txt"
-rpm -qa | grep -E '^(samba|libwbclient|libsmbclient|libtalloc|libtdb|libtevent|libldb)' | sort \
-  > "$BACKUP_DIR/packages-before-samba.txt" || true
-if [[ -f /etc/samba/smb.conf ]]; then
-  cp -a /etc/samba/smb.conf "$BACKUP_DIR/smb.conf"
-fi
-if [[ -d /var/lib/samba/private ]]; then
-  cp -a /var/lib/samba/private "$BACKUP_DIR/samba-private" 2>/dev/null || true
-fi
-
 echo "== 当前 Samba 相关包 =="
-cat "$BACKUP_DIR/packages-before-samba.txt" || true
+rpm -qa | grep -E '^(samba|libwbclient|libsmbclient|libtalloc|libtdb|libtevent|libldb)' | sort || true
 
-REPO_FILE="/etc/yum.repos.d/samba-offline-local.repo"
-cat > "$REPO_FILE" <<EOF
+# 使用临时 reposdir，避免为了离线事务检查向 /etc/yum.repos.d 写入配置。
+TMP_REPO_DIR="$(mktemp -d /tmp/samba-offline-repo.XXXXXX)"
+TMP_CACHE_DIR="$TMP_REPO_DIR/cache"
+mkdir -p "$TMP_CACHE_DIR"
+cat > "$TMP_REPO_DIR/samba-offline-local.repo" <<EOF
 [samba-offline-local]
 name=Kylin Samba Offline Local Repository
 baseurl=file://$RPM_DIR
@@ -81,7 +100,7 @@ metadata_expire=0
 EOF
 
 cleanup_repo() {
-  rm -f "$REPO_FILE"
+  rm -rf "$TMP_REPO_DIR"
 }
 trap cleanup_repo EXIT
 
@@ -93,23 +112,44 @@ TARGETS=(
 )
 
 COMMON_ARGS=(
+  --setopt="reposdir=$TMP_REPO_DIR"
+  --setopt="cachedir=$TMP_CACHE_DIR"
   --disablerepo='*'
   --enablerepo='samba-offline-local'
   --setopt=install_weak_deps=False
   --nogpgcheck
 )
 
-"$PKG_MGR" "${COMMON_ARGS[@]}" clean metadata >/dev/null 2>&1 || true
 "$PKG_MGR" "${COMMON_ARGS[@]}" makecache
 
 echo
-echo "== 离线事务预检查（不会修改系统） =="
+echo "== 离线事务预检查（不会修改 RPM 数据库） =="
 if ! "$PKG_MGR" -y "${COMMON_ARGS[@]}" --setopt=tsflags=test install "${TARGETS[@]}"; then
   echo >&2
   echo "依赖事务预检查失败，未安装任何软件。" >&2
   echo "本 Release 应包含 Samba 所有强依赖；请把上面的完整错误反馈回来。" >&2
   echo "不要使用 --nodeps，也不要临时启用互联网软件源。" >&2
   exit 2
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo
+  echo "== DRY-RUN 完成 =="
+  echo "上面的 Transaction Summary 就是正式执行时 DNF/YUM 计划的安装/升级集合。"
+  echo "未安装或升级任何 RPM；未修改 smb.conf；未安装、覆盖或启动 Sambly。"
+  exit 0
+fi
+
+BACKUP_DIR="/root/samba-sambly-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+rpm -qa | sort > "$BACKUP_DIR/packages-before-all.txt"
+rpm -qa | grep -E '^(samba|libwbclient|libsmbclient|libtalloc|libtdb|libtevent|libldb)' | sort \
+  > "$BACKUP_DIR/packages-before-samba.txt" || true
+if [[ -f /etc/samba/smb.conf ]]; then
+  cp -a /etc/samba/smb.conf "$BACKUP_DIR/smb.conf"
+fi
+if [[ -d /var/lib/samba/private ]]; then
+  cp -a /var/lib/samba/private "$BACKUP_DIR/samba-private" 2>/dev/null || true
 fi
 
 echo
@@ -149,7 +189,7 @@ if ! systemctl cat smbd.service >/dev/null 2>&1; then
 fi
 
 echo
-echo "== 安装 Sambly ARM64 单二进制 =="
+echo "== 安装/更新 Sambly ARM64 单二进制 =="
 install -m 0755 "$SAMBLY_BIN" /usr/local/bin/sambly
 install -d -m 0750 /var/lib/sambly
 
@@ -195,7 +235,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now sambly
+systemctl enable sambly
+# restart 在服务已运行时能加载刚覆盖的新二进制；未运行时也会启动。
+systemctl restart sambly
 
 for _ in $(seq 1 15); do
   [[ -f /var/lib/sambly/initial-credentials.txt ]] && break

@@ -39,15 +39,19 @@ jobs:
       - name: Validate scripts and DFS settings
         run: |
           set -euxo pipefail
-          for f in scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh; do
+          for f in scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh scripts/patch-sambly-offline.sh; do
             test -s "$f"
             bash -n "$f"
           done
           grep -Fq 'samba-offline-local' scripts/install.sh
           grep -Fq 'tsflags=test' scripts/install.sh
           grep -Fq -- "--disablerepo='*'" scripts/install.sh
+          grep -Fq -- '--dry-run' scripts/install.sh
+          grep -Fq 'DRY_RUN' scripts/install.sh
           grep -Fq 'msdfs root = yes' scripts/configure-dfs-root.sh
           grep -Fq 'msdfs:' scripts/add-dfs-target.sh
+          grep -Fq 'htmx.min.js' scripts/patch-sambly-offline.sh
+          grep -Fq 'alpine.min.js' scripts/patch-sambly-offline.sh
 
   build:
     name: Build verified full ARM64 bundle
@@ -109,9 +113,6 @@ jobs:
 
               dnf clean all
               dnf makecache --disablerepo="*" --enablerepo="$repos"
-
-              # Download every recursively required strong dependency even when the
-              # ARM64 build container already has a compatible provider installed.
               dnf --disablerepo="*" --enablerepo="$repos" \
                 --setopt=install_weak_deps=False \
                 download --resolve --alldeps \
@@ -144,8 +145,6 @@ jobs:
           https://update.cs2c.com.cn/NS/V10/V10SP3-2403/os/adv/lic/updates/aarch64/
           EOF
 
-              # Strong proof: install the pinned Samba roots into an empty filesystem
-              # using ONLY the generated local repository. Missing dependencies fail here.
               rm -rf /tmp/kylin-offline-root
               mkdir -p /tmp/kylin-offline-root
               dnf -y --installroot=/tmp/kylin-offline-root --releasever=10 \
@@ -181,15 +180,52 @@ jobs:
           echo "Resolved RPM count: $count"
           du -sh "$bundle/rpms"
 
-      - name: Build and test Sambly ARM64 static binary
+      - name: Build, smoke-test and audit fully-offline Sambly
         run: |
           set -euxo pipefail
           git clone "$SAMBLY_REPO" third_party/Sambly
           git -C third_party/Sambly checkout --detach "$SAMBLY_COMMIT"
+          test "$(git -C third_party/Sambly rev-parse HEAD)" = "$SAMBLY_COMMIT"
+
+          bash scripts/patch-sambly-offline.sh third_party/Sambly
+
           (
             cd third_party/Sambly
-            test "$(git rev-parse HEAD)" = "$SAMBLY_COMMIT"
             go test ./...
+            CGO_ENABLED=0 go build -trimpath -o /tmp/sambly-smoke ./cmd/server
+          )
+
+          smoke_data="$(mktemp -d)"
+          printf 'ADMIN_USERNAME=admin\nADMIN_PASSWORD=OfflineSmokePass123!\n' > "$smoke_data/setup.env"
+          /tmp/sambly-smoke --addr=127.0.0.1:18090 --data="$smoke_data" >/tmp/sambly-smoke.log 2>&1 &
+          smoke_pid=$!
+          cleanup_smoke() {
+            kill "$smoke_pid" 2>/dev/null || true
+            wait "$smoke_pid" 2>/dev/null || true
+            rm -rf "$smoke_data"
+          }
+          trap cleanup_smoke EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18090/login >/tmp/sambly-login.html; then
+              break
+            fi
+            sleep 1
+          done
+          test -s /tmp/sambly-login.html
+          grep -Fq 'src="/static/htmx.min.js"' /tmp/sambly-login.html
+          grep -Fq 'src="/static/alpine.min.js"' /tmp/sambly-login.html
+          if grep -Eq 'unpkg\.com|cdn\.jsdelivr\.net' /tmp/sambly-login.html; then
+            echo 'external CDN reference remains in rendered login page' >&2
+            exit 1
+          fi
+          test "$(curl -fsS http://127.0.0.1:18090/static/htmx.min.js | wc -c)" -gt 10000
+          test "$(curl -fsS http://127.0.0.1:18090/static/alpine.min.js | wc -c)" -gt 10000
+          cleanup_smoke
+          trap - EXIT
+
+          (
+            cd third_party/Sambly
             CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
               -o "../../build/${BUNDLE_NAME}/webui/sambly/sambly" ./cmd/server
           )
@@ -200,7 +236,13 @@ jobs:
             echo 'Sambly unexpectedly has dynamic library dependencies' >&2
             exit 1
           fi
+          if strings "build/${BUNDLE_NAME}/webui/sambly/sambly" | grep -Eq 'https://(unpkg\.com|cdn\.jsdelivr\.net)'; then
+            echo 'external frontend CDN URL remains embedded in Sambly binary' >&2
+            exit 1
+          fi
+
           cp third_party/Sambly/LICENSE "build/${BUNDLE_NAME}/licenses/Sambly-LICENSE"
+          cp third_party/Sambly/OFFLINE-FRONTEND-ASSETS.txt "build/${BUNDLE_NAME}/webui/sambly/FRONTEND-ASSETS.txt"
           printf '%s\n' "source=$SAMBLY_REPO" "commit=$SAMBLY_COMMIT" \
             > "build/${BUNDLE_NAME}/webui/sambly/SOURCE.txt"
 
@@ -219,7 +261,11 @@ jobs:
           Kylin official Base/Updates repositories. The workflow verified it by
           installing Samba into an empty installroot using only rpms/ as file:// repo.
 
-          Install: sudo bash install.sh
+          Sambly htmx and Alpine.js assets are embedded into the ARM64 binary.
+          Runtime browsers do not need Internet/DNS access to unpkg.com or jsdelivr.net.
+
+          Preview only: sudo bash install.sh --dry-run
+          Install/update: sudo bash install.sh
           DFS root: sudo bash configure-dfs-root.sh
           Add target: sudo bash add-dfs-target.sh kylin01 192.168.88.211 ledong_share
           Windows: \\\\<DFS-IP>\\files
@@ -239,9 +285,11 @@ jobs:
           bash -n install.sh
           bash -n configure-dfs-root.sh
           bash -n add-dfs-target.sh
+          grep -Fq -- '--dry-run' install.sh
           test -f rpms/repodata/repomd.xml
           test "$(find rpms -maxdepth 1 -type f -name '*.rpm' | wc -l)" -gt 7
           readelf -h webui/sambly/sambly | grep -q 'AArch64'
+          test -s webui/sambly/FRONTEND-ASSETS.txt
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -259,7 +307,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
-          notes='Verified full offline bundle for Kylin V10 SP3-2403 aarch64: Samba 4.11.12-32.p11 plus recursively resolved strong dependencies from Kylin official repositories, empty-installroot offline proof, Sambly ARM64 static binary, DFS helpers and SHA256 checksums.'
+          notes='Verified full offline bundle for Kylin V10 SP3-2403 aarch64: Samba 4.11.12-32.p11 plus recursively resolved strong dependencies from Kylin official repositories, empty-installroot offline proof, Sambly ARM64 static binary with locally embedded htmx/Alpine.js frontend assets, real install.sh --dry-run, DFS helpers and SHA256 checksums.'
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "build/${BUNDLE_NAME}.tar.gz" "build/${BUNDLE_NAME}.tar.gz.sha256" --clobber
             gh release edit "$RELEASE_TAG" --title 'Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Full Offline Bundle' --notes "$notes"
