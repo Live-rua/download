@@ -1,0 +1,99 @@
+name: Publish Samba 3.2 Migration Fixed Script
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/migrate-samba32-to-411.sh
+      - .github/workflows/publish-samba32-migration-fixed.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish-fixed-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate fixed migration script
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp scripts/migrate-samba32-to-411.sh dist/migrate-samba32-to-411-fixed.sh
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('dist/migrate-samba32-to-411-fixed.sh')
+          s = p.read_text(encoding='utf-8')
+
+          old = '''  "$bin" -b 2>/dev/null | awk -F': ' -v k="$key" '$1 ~ "^[[:space:]]*" k "$" {print $2; exit}' '''.rstrip()
+          new = '''  "$bin" -b 2>/dev/null | awk -F': ' -v k="$key" '$1 ~ "^[[:space:]]*" k "$" && v == "" {v=$2} END {if (v != "") print v}' '''.rstrip()
+
+          if old not in s:
+              raise SystemExit('expected build_value implementation not found; refusing to publish')
+
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+
+          chmod 0755 dist/migrate-samba32-to-411-fixed.sh
+
+      - name: Validate fixed script
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n dist/migrate-samba32-to-411-fixed.sh
+
+          grep -Fq '&& v == "" {v=$2} END {if (v != "") print v}' \
+            dist/migrate-samba32-to-411-fixed.sh
+
+          if sed -n '/^build_value()/,/^}/p' dist/migrate-samba32-to-411-fixed.sh | grep -Fq '{print $2; exit}'; then
+            echo 'old pipefail/SIGPIPE-prone build_value implementation is still present' >&2
+            exit 1
+          fi
+
+          cat > /tmp/fake-smbd <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ "${1:-}" == "-b" ]] || exit 2
+          echo '   SBINDIR: /usr/sbin'
+          echo '   CONFIGFILE: /etc/samba/smb.conf'
+          echo '   PRIVATE_DIR: /var/lib/samba/private'
+          for i in $(seq 1 20000); do
+            echo "   EXTRA_${i}: value_${i}"
+          done
+          EOF
+          chmod +x /tmp/fake-smbd
+
+          set -o pipefail
+          value="$(/tmp/fake-smbd -b 2>/dev/null | awk -F': ' -v k='CONFIGFILE' '$1 ~ "^[[:space:]]*" k "$" && v == "" {v=$2} END {if (v != "") print v}')"
+          [[ "$value" == '/etc/samba/smb.conf' ]]
+          echo 'build_value pipefail regression test: PASS'
+
+      - name: Publish release with script only
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG='samba32-migration-fixed'
+          FILE='dist/migrate-samba32-to-411-fixed.sh'
+
+          gh release delete "$TAG" --cleanup-tag --yes >/dev/null 2>&1 || true
+
+          gh release create "$TAG" "$FILE" \
+            --target "$GITHUB_SHA" \
+            --title 'Samba 3.2 -> 4.11 migration fixed script' \
+            --notes 'Only asset: migrate-samba32-to-411-fixed.sh. Fixes the build_value pipefail/SIGPIPE premature-exit issue found during an in-place Samba 3.2 to 4.11 migration.'
+
+          count="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets | length')"
+          [[ "$count" == '1' ]]
+          name="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets[0].name')"
+          [[ "$name" == 'migrate-samba32-to-411-fixed.sh' ]]
+          echo "Published only asset: $name"
