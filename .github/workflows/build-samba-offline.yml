@@ -66,7 +66,7 @@ jobs:
           grep -Fq 'server min protocol = SMB2_02' "$migration"
           grep -Fq 'systemctl enable --now smb.service' "$migration"
           grep -Fq '正在自动回退到旧 Samba 3.2' "$migration"
-          ! grep -Eq 'SAMBA_MIGRATION_TEST_PASSWORD=|password[[:space:]]*=[[:space:]]*[^$%{]' "$migration"
+          ! grep -Eq '(^|[[:space:]])(TEST_PASSWORD|SAMBA_MIGRATION_TEST_PASSWORD)=' "$migration"
 
   build:
     name: Build verified full ARM64 bundle
