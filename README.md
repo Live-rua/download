@@ -50,6 +50,7 @@ kylin-v10sp3-aarch64-samba-sambly-full/
 ├── licenses/
 │   └── Sambly-LICENSE
 ├── install.sh
+├── migrate-samba32-to-411.sh
 ├── configure-dfs-root.sh
 ├── add-dfs-target.sh
 ├── packages-manifest.txt
@@ -168,6 +169,79 @@ sudo bash install.sh
 /root/samba-sambly-backup-YYYYmmdd-HHMMSS/
 ```
 
+## Samba 3.2 原机迁移到 4.11
+
+针对 `/usr/local/samba` 源码安装的 Samba 3.2 + `tdbsam` 老服务器，完整包额外提供：
+
+```text
+migrate-samba32-to-411.sh
+```
+
+目标是保持以下内容不变：
+
+- 服务器 IP；
+- 共享名称和共享路径；
+- Linux 用户以及 UID/GID/组关系；
+- Samba 用户；
+- Samba NT 密码哈希；
+- Samba 用户 SID；
+- Samba 本机 SID；
+- 共享目录现有 owner/group/mode/大小元数据。
+
+旧 `/usr/local/samba` 不删除，保留作为回退路径。新 Samba 使用 RPM 安装到系统路径，最低协议明确设置为 SMB2_02。
+
+先执行只读准备：
+
+```bash
+sudo bash migrate-samba32-to-411.sh \
+  --prepare \
+  --test-user wuhongguang \
+  --test-share ledong_share
+```
+
+`--prepare` 会：
+
+1. 确认 Kylin V10 / ARM64 / 旧源码 Samba 路径；
+2. 确认旧认证后端是 `tdbsam`；
+3. 记录 Samba 版本、配置、用户、SID、TDB 清单、RPM 清单；
+4. 完整备份 `/usr/local/samba`、Linux 用户/组数据库及已有系统 Samba 目录；
+5. 生成密码指纹、用户 SID 指纹、Linux 身份指纹；
+6. 调用 `install.sh --dry-run` 验证离线 RPM 事务；
+7. 不停止旧 Samba，不安装 RPM。
+
+确认准备结果后执行正式迁移：
+
+```bash
+sudo bash migrate-samba32-to-411.sh \
+  --apply \
+  --test-user wuhongguang \
+  --test-share ledong_share
+```
+
+脚本会在终端安全提示输入测试账号的当前 Samba 密码。密码不会作为命令行参数写入，也不会提交到仓库或迁移报告；实际验证使用临时 `0600` 凭据文件，退出时删除。
+
+`--apply` 会：
+
+1. 在旧 `smbd` 仍运行时安装 Samba 4.11 RPM；`install.sh` 本身不启动 Samba 文件服务；
+2. 用 Samba 4.11 `testparm` 预检迁移后的配置；
+3. 默认拒绝在存在活动 SMB 会话时切换；
+4. 停旧 Samba 后重新做一致性备份；
+5. 使用 Samba 4.11 `pdbedit -i/-e` 从旧 `passdb.tdb` 副本迁移 `tdbsam` 数据；
+6. 使用原 `net getlocalsid` / `net setlocalsid` 保持本机 SID；
+7. 比对 Samba 用户名、UID/NT 密码指纹、用户 SID 指纹、Linux UID/GID/组指纹；
+8. 比对共享目录文件权限元数据指纹；
+9. 全部一致后才启动 `smb.service`；
+10. 使用指定测试账号执行真实 SMB3 `smbclient` 登录与目录浏览；
+11. 任一关键检查失败时自动停新服务并尝试恢复旧 `/usr/local/samba/sbin/smbd -D` / `nmbd -D`。
+
+人工回退入口：
+
+```bash
+sudo bash migrate-samba32-to-411.sh --rollback
+```
+
+不要把生产密码写进 GitHub Actions workflow、README 或命令行参数。测试账号可以作为参数公开，密码只在目标服务器交互输入。
+
 ## Sambly
 
 默认启动在：
@@ -250,14 +324,15 @@ Windows 进入某个 DFS 目录后会根据 referral 直接连接对应后端 Sa
 完整 Release 只有在以下条件全部满足后才会创建：
 
 1. Shell 脚本静态语法检查通过；
-2. 从麒麟官方仓库成功解析并下载完整 Samba 强依赖闭包；
-3. RPM 只允许 `aarch64` 和 `noarch`；
-4. 四个固定 Samba p11 根包存在；
-5. 本地 `repodata` 成功生成；
-6. 空 installroot 在完全禁用在线仓库的情况下成功安装 Samba；
-7. Sambly upstream tests 通过；
-8. Sambly 为 ARM64 静态 ELF；
-9. 包内 SHA256 全部验证通过；
-10. 最终 tar.gz 再次解压审计成功。
+2. Samba 3.2 迁移脚本包含 prepare/apply/rollback、安全密码输入、tdbsam 导入、SID/密码/UID/GID/共享元数据校验和自动回退保护；
+3. 从麒麟官方仓库成功解析并下载完整 Samba 强依赖闭包；
+4. RPM 只允许 `aarch64` 和 `noarch`；
+5. 四个固定 Samba p11 根包存在；
+6. 本地 `repodata` 成功生成；
+7. 空 installroot 在完全禁用在线仓库的情况下成功安装 Samba；
+8. Sambly upstream tests 通过；
+9. Sambly 为 ARM64 静态 ELF；
+10. 包内 SHA256 全部验证通过；
+11. 最终 tar.gz 再次解压，并再次对迁移脚本执行语法/关键保护项审计。
 
 PR 只执行快速静态检查；合并到 `main` 后才执行完整 ARM64 下载、纯离线验证、打包并发布 Release。
