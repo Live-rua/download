@@ -85,11 +85,10 @@ fi
 echo "== 当前 Samba 相关包 =="
 rpm -qa | grep -E '^(samba|libwbclient|libsmbclient|libtalloc|libtdb|libtevent|libldb)' | sort || true
 
-# 使用临时 reposdir，避免为了离线事务检查向 /etc/yum.repos.d 写入配置。
 TMP_REPO_DIR="$(mktemp -d /tmp/samba-offline-repo.XXXXXX)"
 TMP_CACHE_DIR="$TMP_REPO_DIR/cache"
 mkdir -p "$TMP_CACHE_DIR"
-cat > "$TMP_REPO_DIR/samba-offline-local.repo" <<EOF
+cat >"$TMP_REPO_DIR/samba-offline-local.repo" <<EOF
 [samba-offline-local]
 name=Kylin Samba Offline Local Repository
 baseurl=file://$RPM_DIR
@@ -142,9 +141,9 @@ fi
 
 BACKUP_DIR="/root/samba-sambly-backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
-rpm -qa | sort > "$BACKUP_DIR/packages-before-all.txt"
+rpm -qa | sort >"$BACKUP_DIR/packages-before-all.txt"
 rpm -qa | grep -E '^(samba|libwbclient|libsmbclient|libtalloc|libtdb|libtevent|libldb)' | sort \
-  > "$BACKUP_DIR/packages-before-samba.txt" || true
+  >"$BACKUP_DIR/packages-before-samba.txt" || true
 if [[ -f /etc/samba/smb.conf ]]; then
   cp -a /etc/samba/smb.conf "$BACKUP_DIR/smb.conf"
 fi
@@ -172,8 +171,6 @@ else
 fi
 rpm -qa | grep -E '^(samba|libwbclient|libsmbclient)' | sort
 
-# Sambly 上游使用 smbd.service 控制 Samba；Kylin/RHEL RPM 通常提供 smb.service。
-# 创建 systemd alias，使 UI 的启停/重启按钮可以直接工作。
 if ! systemctl cat smbd.service >/dev/null 2>&1; then
   SMB_UNIT="$(systemctl show -p FragmentPath --value smb.service 2>/dev/null || true)"
   if [[ -z "$SMB_UNIT" || ! -f "$SMB_UNIT" ]]; then
@@ -212,11 +209,11 @@ if [[ ! -f /var/lib/sambly/sambly.db ]]; then
     if [[ -n "$SAMBLY_ADMIN_PASSWORD" ]]; then
       printf 'ADMIN_PASSWORD=%s\n' "$SAMBLY_ADMIN_PASSWORD"
     fi
-  } > /var/lib/sambly/setup.env
+  } >/var/lib/sambly/setup.env
   chmod 0600 /var/lib/sambly/setup.env
 fi
 
-cat > /etc/systemd/system/sambly.service <<EOF
+cat >/etc/systemd/system/sambly.service <<EOF
 [Unit]
 Description=Sambly - Samba Web Manager
 After=network.target
@@ -236,7 +233,6 @@ EOF
 
 systemctl daemon-reload
 systemctl enable sambly
-# restart 在服务已运行时能加载刚覆盖的新二进制；未运行时也会启动。
 systemctl restart sambly
 
 for _ in $(seq 1 15); do
@@ -251,9 +247,10 @@ echo "Samba：$(smbd -V)"
 echo "Sambly：http://<服务器IP>:${SAMBLY_PORT}"
 echo "Sambly 状态：systemctl status sambly --no-pager -l"
 if [[ -f /var/lib/sambly/initial-credentials.txt ]]; then
-  echo "首次登录凭据："
-  cat /var/lib/sambly/initial-credentials.txt
-  echo "登录并修改密码后建议删除该凭据文件。"
+  chmod 0600 /var/lib/sambly/initial-credentials.txt
+  echo "首次登录凭据已写入：/var/lib/sambly/initial-credentials.txt（0600）"
+  echo "为避免密码进入终端/审计日志，安装脚本不会打印该文件内容。"
+  echo "请在服务器本机查看，登录并修改密码后删除该凭据文件。"
 fi
 echo
 echo "注意：本脚本没有自动启动 Samba，也没有修改现有 smb.conf。"
