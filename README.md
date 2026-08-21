@@ -161,7 +161,8 @@ sudo bash install.sh
 - 不使用 `--nodeps`；
 - 不访问互联网软件源；
 - 不自动覆盖现有 `/etc/samba/smb.conf`；
-- 不自动启动 Samba 文件服务。
+- 不自动启动 Samba 文件服务；
+- Sambly 首次凭据只写到 `/var/lib/sambly/initial-credentials.txt`（0600），安装脚本不把密码打印到终端/审计日志。
 
 安装前会备份现有 Samba 配置和 RPM 清单到：
 
@@ -190,6 +191,26 @@ migrate-samba32-to-411.sh
 
 旧 `/usr/local/samba` 不删除，保留作为回退路径。新 Samba 使用 RPM 安装到系统路径，最低协议明确设置为 SMB2_02。
 
+### 为什么不再使用 `pdbedit -i/-e`
+
+现场迁移验证发现：Samba 4.11 的 `pdbedit -i tdbsam:<旧库> -e tdbsam:<新库>` 在该 Samba 3.2 数据库上可以返回成功，但生成的目标 TDB 实际为 **0 用户**。因此正式脚本明确禁止继续使用该路径。
+
+已验证可用的迁移方式是：
+
+1. 停止旧 Samba，确保旧 `passdb.tdb` 静止；
+2. 复制旧 `passdb.tdb` 到切换备份中的候选文件；
+3. 使用 Samba 4.11：
+   ```bash
+   pdbedit -b tdbsam:<候选passdb.tdb> -L
+   ```
+   打开候选副本，由 Samba 4.11 在副本上原地完成旧 TDB 格式到 4.x 的转换；
+4. 候选库必须仍有全部用户，并且用户名、NT 密码指纹、用户 SID 指纹与旧库完全一致；
+5. 只有候选库通过全部校验后，才安装到 `/var/lib/samba/private/passdb.tdb`。
+
+这个流程不会直接修改 `/usr/local/samba/private/passdb.tdb`。
+
+### PREPARE
+
 先执行只读准备：
 
 ```bash
@@ -209,6 +230,8 @@ sudo bash migrate-samba32-to-411.sh \
 6. 调用 `install.sh --dry-run` 验证离线 RPM 事务；
 7. 不停止旧 Samba，不安装 RPM。
 
+### APPLY
+
 确认准备结果后执行正式迁移：
 
 ```bash
@@ -223,16 +246,22 @@ sudo bash migrate-samba32-to-411.sh \
 `--apply` 会：
 
 1. 在旧 `smbd` 仍运行时安装 Samba 4.11 RPM；`install.sh` 本身不启动 Samba 文件服务；
-2. 用 Samba 4.11 `testparm` 预检迁移后的配置；
-3. 默认拒绝在存在活动 SMB 会话时切换；
-4. 停旧 Samba 后重新做一致性备份；
-5. 使用 Samba 4.11 `pdbedit -i/-e` 从旧 `passdb.tdb` 副本迁移 `tdbsam` 数据；
-6. 使用原 `net getlocalsid` / `net setlocalsid` 保持本机 SID；
-7. 比对 Samba 用户名、UID/NT 密码指纹、用户 SID 指纹、Linux UID/GID/组指纹；
-8. 比对共享目录文件权限元数据指纹；
-9. 全部一致后才启动 `smb.service`；
-10. 使用指定测试账号执行真实 SMB3 `smbclient` 登录与目录浏览；
-11. 任一关键检查失败时自动停新服务并尝试恢复旧 `/usr/local/samba/sbin/smbd -D` / `nmbd -D`。
+2. 解析系统 Samba 的真实编译路径，并用 Samba 4.11 `testparm` 预检迁移配置；
+3. 默认拒绝存在活动 SMB 会话的切换；
+4. 安装阶段再次确认 TCP 445 仍只由旧 `/usr/local/samba/sbin/smbd` 持有；
+5. 再次验证旧用户、NT 密码指纹、用户 SID、Linux UID/GID/组关系在安装期间没有变化；
+6. 停止旧 Samba，并等待 TCP 445 确实释放；
+7. 对静止的旧 `passdb.tdb` 做最终备份，再复制出 Samba 4.11 候选库；
+8. 使用 Samba 4.11 `pdbedit -b tdbsam:<候选库> -L` 在候选副本上原地转换；
+9. 拒绝 0 用户候选库，并比对用户数、用户名、NT 密码指纹、用户 SID 和 Linux 身份指纹；
+10. 使用原 `net getlocalsid` / `net setlocalsid` 保持本机 SID；
+11. 将验证后的候选库安装到新 Samba private dir，再从默认配置重新读取并重复用户数/密码/SID 校验；
+12. 比对共享目录文件权限元数据指纹；
+13. 启动 `smb.service` 前确认 445 已释放；启动后确认 445 **只由 `/usr/sbin/smbd` 持有**，拒绝旧/新双 Samba；
+14. 使用指定测试账号执行真实 SMB3 `smbclient` 登录和目录浏览；
+15. 最终再次核对用户数、密码、用户 SID、Linux 身份和共享元数据；
+16. 所有步骤成功后才把迁移状态写为 `completed`；
+17. 任一切换后关键检查失败时，自动停止新 Samba、恢复新 Samba 切换前身份库，并重新启动旧 `/usr/local/samba/sbin/smbd -D` / `nmbd -D`。
 
 人工回退入口：
 
@@ -259,11 +288,13 @@ sudo SAMBLY_ADMIN_USER=admin \
      bash install.sh
 ```
 
-不指定密码时，首次启动后查看：
+不指定密码时，首次启动后在服务器本机查看：
 
 ```bash
 cat /var/lib/sambly/initial-credentials.txt
 ```
+
+该文件权限为 `0600`。登录并修改密码后应删除它。安装脚本本身不会把初始密码打印到终端。
 
 8090 只建议对可信管理网络开放。
 
@@ -324,15 +355,18 @@ Windows 进入某个 DFS 目录后会根据 referral 直接连接对应后端 Sa
 完整 Release 只有在以下条件全部满足后才会创建：
 
 1. Shell 脚本静态语法检查通过；
-2. Samba 3.2 迁移脚本包含 prepare/apply/rollback、安全密码输入、tdbsam 导入、SID/密码/UID/GID/共享元数据校验和自动回退保护；
-3. 从麒麟官方仓库成功解析并下载完整 Samba 强依赖闭包；
-4. RPM 只允许 `aarch64` 和 `noarch`；
-5. 四个固定 Samba p11 根包存在；
-6. 本地 `repodata` 成功生成；
-7. 空 installroot 在完全禁用在线仓库的情况下成功安装 Samba；
-8. Sambly upstream tests 通过；
-9. Sambly 为 ARM64 静态 ELF；
-10. 包内 SHA256 全部验证通过；
-11. 最终 tar.gz 再次解压，并再次对迁移脚本执行语法/关键保护项审计。
+2. `build_value()` 通过 `set -o pipefail` + 20,000 行模拟 `smbd -b` 输出回归测试，避免 SIGPIPE 提前退出；
+3. 迁移脚本明确包含 prepare/apply/rollback、安全密码输入、候选库直接转换、0 用户拒绝、SID/密码/UID/GID/共享元数据校验和自动回退；
+4. Action 明确拒绝重新引入已现场失败的 `pdbedit -i/-e` passdb 迁移路径；
+5. 迁移脚本包含 TCP 445 单一所有者校验，防止旧 `/usr/local/samba/sbin/smbd` 与新 `/usr/sbin/smbd` 同时监听；
+6. 从麒麟官方仓库成功解析并下载完整 Samba 强依赖闭包；
+7. RPM 只允许 `aarch64` 和 `noarch`；
+8. 四个固定 Samba p11 根包存在；
+9. 本地 `repodata` 成功生成；
+10. 空 installroot 在完全禁用在线仓库的情况下成功安装 Samba；
+11. Sambly upstream tests 通过；
+12. Sambly 为 ARM64 静态 ELF；
+13. 包内 SHA256 全部验证通过；
+14. 最终 tar.gz 再次解压，并再次对迁移脚本执行语法和关键保护项审计。
 
 PR 只执行快速静态检查；合并到 `main` 后才执行完整 ARM64 下载、纯离线验证、打包并发布 Release。

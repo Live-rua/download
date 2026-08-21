@@ -36,37 +36,105 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Validate scripts, DFS and migration safeguards
+
+      - name: Validate scripts, DFS and field-proven migration safeguards
+        shell: bash
         run: |
           set -euxo pipefail
-          for f in scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh scripts/patch-sambly-offline.sh scripts/migrate-samba32-to-411.sh; do
+
+          for f in \
+            scripts/install.sh \
+            scripts/configure-dfs-root.sh \
+            scripts/add-dfs-target.sh \
+            scripts/patch-sambly-offline.sh \
+            scripts/migrate-samba32-to-411.sh
+          do
             test -s "$f"
             bash -n "$f"
           done
+
           grep -Fq 'samba-offline-local' scripts/install.sh
           grep -Fq 'tsflags=test' scripts/install.sh
           grep -Fq -- "--disablerepo='*'" scripts/install.sh
           grep -Fq -- '--dry-run' scripts/install.sh
           grep -Fq 'DRY_RUN' scripts/install.sh
+          grep -Fq '/var/lib/sambly/initial-credentials.txt' scripts/install.sh
+          ! grep -Fq 'cat /var/lib/sambly/initial-credentials.txt' scripts/install.sh
+
           grep -Fq 'msdfs root = yes' scripts/configure-dfs-root.sh
           grep -Fq 'msdfs:' scripts/add-dfs-target.sh
           grep -Fq 'htmx.min.js' scripts/patch-sambly-offline.sh
           grep -Fq 'alpine.min.js' scripts/patch-sambly-offline.sh
 
           migration=scripts/migrate-samba32-to-411.sh
-          bash "$migration" --help | grep -Fq -- '--prepare'
-          bash "$migration" --help | grep -Fq -- '--apply'
-          bash "$migration" --help | grep -Fq -- '--rollback'
-          grep -Fq 'tdbsam:' "$migration"
+          help="$(bash "$migration" --help)"
+          grep -Fq -- '--prepare' <<<"$help"
+          grep -Fq -- '--apply' <<<"$help"
+          grep -Fq -- '--rollback' <<<"$help"
+
+          grep -Fq 'build_value()' "$migration"
+          grep -Fq 'value == "" { value=$2 }' "$migration"
+          if sed -n '/^build_value()/,/^}/p' "$migration" | grep -Fq '{print $2; exit}'; then
+            echo 'build_value still contains the pipefail/SIGPIPE-prone early exit' >&2
+            exit 1
+          fi
+
+          grep -Fq 'passdb.tdb.for-411' "$migration"
+          grep -Fq 'cp -a "$backup/cutover/old-private/passdb.tdb" "$staged_passdb"' "$migration"
+          grep -Fq -- '-b "tdbsam:$staged_passdb" -L' "$migration"
+          grep -Fq 'passdb-candidate-user-count.txt' "$migration"
+          grep -Fq 'passdb-installed-user-count.txt' "$migration"
+
+          if grep -Fq '"$NEW_PDBEDIT" -i "tdbsam:' "$migration"; then
+            echo 'unsafe/field-failed pdbedit -i migration path returned' >&2
+            exit 1
+          fi
+          if grep -Fq '"$NEW_PDBEDIT" -e "tdbsam:' "$migration"; then
+            echo 'unsafe/field-failed pdbedit -e migration path returned' >&2
+            exit 1
+          fi
+
           grep -Fq 'setlocalsid' "$migration"
           grep -Fq 'password_fingerprint' "$migration"
           grep -Fq 'sid_fingerprint' "$migration"
           grep -Fq 'linux_identity_fingerprint' "$migration"
           grep -Fq 'share_metadata_fingerprint' "$migration"
           grep -Fq 'server min protocol = SMB2_02' "$migration"
+          grep -Fq 'assert_445_only_executable' "$migration"
+          grep -Fq 'restore_new_identity_state' "$migration"
           grep -Fq 'systemctl enable --now smb.service' "$migration"
+          grep -Fq '真实 SMB3 登录验证' "$migration"
           grep -Fq '正在自动回退到旧 Samba 3.2' "$migration"
           ! grep -Eq '(^|[[:space:]])(TEST_PASSWORD|SAMBA_MIGRATION_TEST_PASSWORD)=' "$migration"
+
+      - name: Regression-test build_value under pipefail
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat >/tmp/fake-smbd <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ "${1:-}" == "-b" ]] || exit 2
+          echo '   SBINDIR: /usr/sbin'
+          echo '   CONFIGFILE: /etc/samba/smb.conf'
+          echo '   PRIVATE_DIR: /var/lib/samba/private'
+          echo '   LOCKDIR: /var/lib/samba/lock'
+          for i in $(seq 1 20000); do
+            echo "   EXTRA_${i}: value_${i}"
+          done
+          EOF
+          chmod +x /tmp/fake-smbd
+
+          value="$(
+            /tmp/fake-smbd -b 2>/dev/null |
+              awk -F': ' -v k='CONFIGFILE' '
+                $1 ~ "^[[:space:]]*" k "$" && value == "" { value=$2 }
+                END { if (value != "") print value }
+              '
+          )"
+          test "$value" = '/etc/samba/smb.conf'
+          echo 'build_value pipefail regression test: PASS'
 
   build:
     name: Build verified full ARM64 bundle
@@ -143,7 +211,10 @@ jobs:
 
               while IFS= read -r -d "" f; do
                 arch="$(rpm -qp --qf "%{ARCH}" "$f")"
-                case "$arch" in aarch64|noarch) ;; *) echo "bad arch: $arch $f" >&2; exit 1;; esac
+                case "$arch" in
+                  aarch64|noarch) ;;
+                  *) echo "bad arch: $arch $f" >&2; exit 1 ;;
+                esac
               done < <(find "/work/build/${BUNDLE_NAME}/rpms" -maxdepth 1 -type f -name "*.rpm" -print0)
 
               createrepo_c "/work/build/${BUNDLE_NAME}/rpms"
@@ -173,7 +244,7 @@ jobs:
               rpm --root /tmp/kylin-offline-root -q samba samba-client samba-common samba-common-tools
               rpm --root /tmp/kylin-offline-root -qa --qf "%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n" | sort \
                 > "/work/build/${BUNDLE_NAME}/offline-installroot-packages.txt"
-              grep -Eq "^samba 4\\.11\\.12-32\\.p11\\.ky10 aarch64$" \
+              grep -Eq "^samba 4\.11\.12-32\.p11\.ky10 aarch64$" \
                 "/work/build/${BUNDLE_NAME}/offline-installroot-packages.txt"
             '
 
@@ -186,7 +257,7 @@ jobs:
           test -f "$bundle/rpms/repodata/repomd.xml"
           test -s "$bundle/offline-installroot-packages.txt"
           for pkg in samba samba-client samba-common samba-common-tools; do
-            grep -Eq "^${pkg} 4\\.11\\.12-32\\.p11\\.ky10 aarch64$" "$bundle/packages-manifest.txt"
+            grep -Eq "^${pkg} 4\.11\.12-32\.p11\.ky10 aarch64$" "$bundle/packages-manifest.txt"
           done
           if grep -Eq ' (x86_64|i[3-6]86)$' "$bundle/packages-manifest.txt"; then
             echo 'non-ARM RPM detected' >&2
@@ -246,12 +317,12 @@ jobs:
           )
           chmod +x "build/${BUNDLE_NAME}/webui/sambly/sambly"
           file "build/${BUNDLE_NAME}/webui/sambly/sambly"
-          readelf -h "build/${BUNDLE_NAME}/webui/sambly/sambly" | grep -q 'AArch64'
-          if readelf -d "build/${BUNDLE_NAME}/webui/sambly/sambly" 2>/dev/null | grep -q '(NEEDED)'; then
+          readelf -h "build/${BUNDLE_NAME}/webui/sambly/sambly" | grep 'AArch64' >/dev/null
+          if readelf -d "build/${BUNDLE_NAME}/webui/sambly/sambly" 2>/dev/null | grep '(NEEDED)' >/dev/null; then
             echo 'Sambly unexpectedly has dynamic library dependencies' >&2
             exit 1
           fi
-          if strings "build/${BUNDLE_NAME}/webui/sambly/sambly" | grep -Eq 'https://(unpkg\.com|cdn\.jsdelivr\.net)'; then
+          if strings "build/${BUNDLE_NAME}/webui/sambly/sambly" | grep -E 'https://(unpkg\.com|cdn\.jsdelivr\.net)' >/dev/null; then
             echo 'external frontend CDN URL remains embedded in Sambly binary' >&2
             exit 1
           fi
@@ -279,6 +350,13 @@ jobs:
           Sambly htmx and Alpine.js assets are embedded into the ARM64 binary.
           Runtime browsers do not need Internet/DNS access to unpkg.com or jsdelivr.net.
 
+          Samba 3.2 migration uses field-validated direct tdbsam conversion:
+          after the old smbd is stopped, its passdb.tdb is copied, opened with Samba
+          4.11 using -b tdbsam:<copy> to perform the in-place 3.x -> 4.x conversion,
+          then user count/names, NT-password fingerprint, user SID, Linux identity,
+          local SID and share metadata are checked before the new service is accepted.
+          The previously used pdbedit -i/-e path is intentionally not used.
+
           Preview only: sudo bash install.sh --dry-run
           Install/update: sudo bash install.sh
           Samba 3.2 migration prepare: sudo bash migrate-samba32-to-411.sh --prepare --test-user wuhongguang --test-share ledong_share
@@ -299,18 +377,26 @@ jobs:
           trap 'rm -rf "$audit"' EXIT
           tar -xzf "${BUNDLE_NAME}.tar.gz" -C "$audit"
           cd "$audit/${BUNDLE_NAME}"
+
           sha256sum -c SHA256SUMS
           bash -n install.sh
           bash -n configure-dfs-root.sh
           bash -n add-dfs-target.sh
           bash -n migrate-samba32-to-411.sh
-          bash migrate-samba32-to-411.sh --help | grep -Fq -- '--apply'
-          grep -Fq 'tdbsam:' migrate-samba32-to-411.sh
+
+          help="$(bash migrate-samba32-to-411.sh --help)"
+          grep -Fq -- '--apply' <<<"$help"
+          grep -Fq 'passdb.tdb.for-411' migrate-samba32-to-411.sh
+          grep -Fq -- '-b "tdbsam:$staged_passdb" -L' migrate-samba32-to-411.sh
+          ! grep -Fq '"$NEW_PDBEDIT" -i "tdbsam:' migrate-samba32-to-411.sh
+          grep -Fq 'assert_445_only_executable' migrate-samba32-to-411.sh
+          grep -Fq 'restore_new_identity_state' migrate-samba32-to-411.sh
           grep -Fq 'setlocalsid' migrate-samba32-to-411.sh
           grep -Fq -- '--dry-run' install.sh
+
           test -f rpms/repodata/repomd.xml
           test "$(find rpms -maxdepth 1 -type f -name '*.rpm' | wc -l)" -gt 7
-          readelf -h webui/sambly/sambly | grep -q 'AArch64'
+          readelf -h webui/sambly/sambly | grep 'AArch64' >/dev/null
           test -s webui/sambly/FRONTEND-ASSETS.txt
 
       - name: Upload workflow artifact
@@ -329,7 +415,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
-          notes='Verified full offline bundle for Kylin V10 SP3-2403 aarch64: Samba 4.11.12-32.p11 plus recursively resolved strong dependencies, Sambly ARM64 static binary, DFS helpers, and guarded Samba 3.2 -> 4.11 in-place migration with SID/password/UID/GID/share-metadata verification and rollback.'
+          notes='Verified full offline bundle for Kylin V10 SP3-2403 aarch64: Samba 4.11.12-32.p11 plus complete strong dependency closure, Sambly ARM64 static binary, DFS helpers, and a field-hardened Samba 3.2 -> 4.11 migration. The migration directly converts a stopped old tdbsam copy with Samba 4.11, rejects 0-user candidates, verifies password/user-SID/Linux-identity/local-SID/share-metadata fingerprints, prevents dual TCP 445 ownership, performs real SMB3 login, and automatically rolls back on failure.'
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "build/${BUNDLE_NAME}.tar.gz" "build/${BUNDLE_NAME}.tar.gz.sha256" --clobber
             gh release edit "$RELEASE_TAG" --title 'Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Full Offline Bundle' --notes "$notes"
