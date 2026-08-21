@@ -36,10 +36,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Validate scripts and DFS settings
+      - name: Validate scripts, DFS and migration safeguards
         run: |
           set -euxo pipefail
-          for f in scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh scripts/patch-sambly-offline.sh; do
+          for f in scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh scripts/patch-sambly-offline.sh scripts/migrate-samba32-to-411.sh; do
             test -s "$f"
             bash -n "$f"
           done
@@ -52,6 +52,21 @@ jobs:
           grep -Fq 'msdfs:' scripts/add-dfs-target.sh
           grep -Fq 'htmx.min.js' scripts/patch-sambly-offline.sh
           grep -Fq 'alpine.min.js' scripts/patch-sambly-offline.sh
+
+          migration=scripts/migrate-samba32-to-411.sh
+          bash "$migration" --help | grep -Fq -- '--prepare'
+          bash "$migration" --help | grep -Fq -- '--apply'
+          bash "$migration" --help | grep -Fq -- '--rollback'
+          grep -Fq 'tdbsam:' "$migration"
+          grep -Fq 'setlocalsid' "$migration"
+          grep -Fq 'password_fingerprint' "$migration"
+          grep -Fq 'sid_fingerprint' "$migration"
+          grep -Fq 'linux_identity_fingerprint' "$migration"
+          grep -Fq 'share_metadata_fingerprint' "$migration"
+          grep -Fq 'server min protocol = SMB2_02' "$migration"
+          grep -Fq 'systemctl enable --now smb.service' "$migration"
+          grep -Fq '正在自动回退到旧 Samba 3.2' "$migration"
+          ! grep -Eq 'SAMBA_MIGRATION_TEST_PASSWORD=|password[[:space:]]*=[[:space:]]*[^$%{]' "$migration"
 
   build:
     name: Build verified full ARM64 bundle
@@ -72,7 +87,7 @@ jobs:
           set -euxo pipefail
           rm -rf build third_party
           mkdir -p "build/${BUNDLE_NAME}/rpms" "build/${BUNDLE_NAME}/webui/sambly" "build/${BUNDLE_NAME}/licenses" third_party
-          cp scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh "build/${BUNDLE_NAME}/"
+          cp scripts/install.sh scripts/configure-dfs-root.sh scripts/add-dfs-target.sh scripts/migrate-samba32-to-411.sh "build/${BUNDLE_NAME}/"
           chmod +x "build/${BUNDLE_NAME}"/*.sh
 
       - name: Resolve, download and prove complete Kylin RPM closure
@@ -266,6 +281,9 @@ jobs:
 
           Preview only: sudo bash install.sh --dry-run
           Install/update: sudo bash install.sh
+          Samba 3.2 migration prepare: sudo bash migrate-samba32-to-411.sh --prepare --test-user wuhongguang --test-share ledong_share
+          Samba 3.2 migration apply: sudo bash migrate-samba32-to-411.sh --apply --test-user wuhongguang --test-share ledong_share
+          Migration rollback: sudo bash migrate-samba32-to-411.sh --rollback
           DFS root: sudo bash configure-dfs-root.sh
           Add target: sudo bash add-dfs-target.sh kylin01 192.168.88.211 ledong_share
           Windows: \\\\<DFS-IP>\\files
@@ -285,6 +303,10 @@ jobs:
           bash -n install.sh
           bash -n configure-dfs-root.sh
           bash -n add-dfs-target.sh
+          bash -n migrate-samba32-to-411.sh
+          bash migrate-samba32-to-411.sh --help | grep -Fq -- '--apply'
+          grep -Fq 'tdbsam:' migrate-samba32-to-411.sh
+          grep -Fq 'setlocalsid' migrate-samba32-to-411.sh
           grep -Fq -- '--dry-run' install.sh
           test -f rpms/repodata/repomd.xml
           test "$(find rpms -maxdepth 1 -type f -name '*.rpm' | wc -l)" -gt 7
@@ -307,7 +329,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
-          notes='Verified full offline bundle for Kylin V10 SP3-2403 aarch64: Samba 4.11.12-32.p11 plus recursively resolved strong dependencies from Kylin official repositories, empty-installroot offline proof, Sambly ARM64 static binary with locally embedded htmx/Alpine.js frontend assets, real install.sh --dry-run, DFS helpers and SHA256 checksums.'
+          notes='Verified full offline bundle for Kylin V10 SP3-2403 aarch64: Samba 4.11.12-32.p11 plus recursively resolved strong dependencies, Sambly ARM64 static binary, DFS helpers, and guarded Samba 3.2 -> 4.11 in-place migration with SID/password/UID/GID/share-metadata verification and rollback.'
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "build/${BUNDLE_NAME}.tar.gz" "build/${BUNDLE_NAME}.tar.gz.sha256" --clobber
             gh release edit "$RELEASE_TAG" --title 'Kylin V10 SP3 ARM64 Samba 4.11 + Sambly Full Offline Bundle' --notes "$notes"
