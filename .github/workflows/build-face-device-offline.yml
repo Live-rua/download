@@ -172,7 +172,7 @@ jobs:
             /bin/bash -euxo pipefail -c '
               PY=/opt/python/cp311-cp311/bin/python
               "$PY" --version
-              ldd --version | head -n 1
+              ldd --version
               "$PY" -m pip install --disable-pip-version-check --no-cache-dir \
                 "requests==$REQUESTS_VERSION" "Pillow==$PILLOW_VERSION"
 
