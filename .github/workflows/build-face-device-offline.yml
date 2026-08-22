@@ -1,0 +1,262 @@
+name: Build Face Device Offline Portable Bundles
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "face-device-offline/**"
+      - ".github/workflows/build-face-device-offline.yml"
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA256: "565ef5068f083e1af6336919f8e33d74f11bf2da80bc43b6638bebbe21e75f8f"
+  PYTHON_VERSION: "3.11.9"
+  REQUESTS_VERSION: "2.32.5"
+  PILLOW_VERSION: "11.3.0"
+
+jobs:
+  windows-amd64:
+    name: Windows AMD64 portable
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct and verify source script
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem "face-device-offline/source/face_device_menu.py.b64.part*" | Sort-Object Name
+          if ($parts.Count -ne 6) { throw "Expected 6 source chunks, got $($parts.Count)" }
+          $joined = (($parts | ForEach-Object { (Get-Content $_.FullName -Raw).Trim() }) -join "")
+          $bytes = [Convert]::FromBase64String($joined)
+          $out = Join-Path $PWD "face-device-offline/face_device_menu.py"
+          [IO.File]::WriteAllBytes($out, $bytes)
+          $actual = (Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "source sha256=$actual"
+          if ($actual -ne $env:SOURCE_SHA256) { throw "Source SHA256 mismatch" }
+
+      - name: Setup build Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+
+      - name: Build Windows offline bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "face-device-offline-windows-amd64-python311"
+          $dist = Join-Path $PWD "dist"
+          $pkg = Join-Path $dist $name
+          $py = Join-Path $pkg "python"
+          $site = Join-Path $py "Lib/site-packages"
+          New-Item -ItemType Directory -Force -Path $site | Out-Null
+
+          $embedZip = Join-Path $env:RUNNER_TEMP "python-$env:PYTHON_VERSION-embed-amd64.zip"
+          $embedUrl = "https://www.python.org/ftp/python/$env:PYTHON_VERSION/python-$env:PYTHON_VERSION-embed-amd64.zip"
+          Invoke-WebRequest -Uri $embedUrl -OutFile $embedZip
+          Expand-Archive -Path $embedZip -DestinationPath $py -Force
+
+          @(
+            "python311.zip"
+            "."
+            "Lib"
+            "Lib\site-packages"
+            "import site"
+          ) | Set-Content -Path (Join-Path $py "python311._pth") -Encoding ascii
+
+          python -m pip install --disable-pip-version-check --no-cache-dir `
+            --target $site `
+            "requests==$env:REQUESTS_VERSION" `
+            "Pillow==$env:PILLOW_VERSION"
+
+          Copy-Item "face-device-offline/face_device_menu.py" (Join-Path $pkg "face_device_menu.py")
+
+          @'
+          @echo off
+          chcp 65001 >nul
+          setlocal
+          cd /d "%~dp0"
+          set "PYTHONUTF8=1"
+          "%~dp0python\python.exe" "%~dp0face_device_menu.py" %*
+          '@ | Set-Content -Path (Join-Path $pkg "run.bat") -Encoding ascii
+
+          @"
+          Face Device Tool - Windows AMD64 离线可移植版
+          ==================================================
+          Python: $env:PYTHON_VERSION (embedded x64)
+          requests: $env:REQUESTS_VERSION
+          Pillow: $env:PILLOW_VERSION
+          Source SHA256: $env:SOURCE_SHA256
+
+          使用：
+          1. 将整个压缩包解压到普通目录，不要只在压缩软件内直接运行。
+          2. 将要上传的人脸图片放到解压后的目录。
+          3. 双击 run.bat，或在 CMD/PowerShell 中执行 run.bat。
+          4. 目标电脑不需要联网，也不需要安装 Python 或 pip。
+
+          注意：脚本仍需要通过局域网访问实际人脸设备的 IP 和端口。
+          "@ | Set-Content -Path (Join-Path $pkg "README_OFFLINE.txt") -Encoding utf8
+
+          $manifest = [ordered]@{
+            platform = "windows-amd64"
+            python = $env:PYTHON_VERSION
+            requests = $env:REQUESTS_VERSION
+            pillow = $env:PILLOW_VERSION
+            source_sha256 = $env:SOURCE_SHA256
+            portable = $true
+            target_requires_python = $false
+            target_requires_internet = $false
+          } | ConvertTo-Json
+          $manifest | Set-Content -Path (Join-Path $pkg "BUILD_INFO.json") -Encoding utf8
+
+          & (Join-Path $py "python.exe") -c "import requests; from PIL import Image; import py_compile; py_compile.compile(r'$pkg\face_device_menu.py', doraise=True); print('Windows portable smoke test OK')"
+
+          $zip = Join-Path $dist "$name.zip"
+          Compress-Archive -Path "$pkg\*" -DestinationPath $zip -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name.zip" | Set-Content -Path "$zip.sha256" -Encoding ascii
+          Get-Item $zip | Format-List Name,Length
+          Get-Content "$zip.sha256"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: face-device-offline-windows-amd64-python311
+          path: |
+            dist/face-device-offline-windows-amd64-python311.zip
+            dist/face-device-offline-windows-amd64-python311.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  kylin-arm64:
+    name: Kylin V10 SP3 ARM64 portable
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct and verify source script
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(find face-device-offline/source -maxdepth 1 -name 'face_device_menu.py.b64.part*' | wc -l)
+          test "$count" -eq 6
+          cat face-device-offline/source/face_device_menu.py.b64.part* | tr -d '\r\n' | base64 -d > face-device-offline/face_device_menu.py
+          echo "$SOURCE_SHA256  face-device-offline/face_device_menu.py" | sha256sum -c -
+
+      - name: Verify ARM runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          test "$(uname -m)" = "aarch64"
+          docker version
+
+      - name: Build in glibc 2.28 ARM64 environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm \
+            --platform linux/arm64 \
+            -e PYTHON_VERSION="$PYTHON_VERSION" \
+            -e REQUESTS_VERSION="$REQUESTS_VERSION" \
+            -e PILLOW_VERSION="$PILLOW_VERSION" \
+            -e SOURCE_SHA256="$SOURCE_SHA256" \
+            -v "$PWD:/io" \
+            -w /io \
+            quay.io/pypa/manylinux_2_28_aarch64:latest \
+            /bin/bash -euxo pipefail -c '
+              PY=/opt/python/cp311-cp311/bin/python
+              "$PY" --version
+              ldd --version | head -n 1
+              "$PY" -m pip install --disable-pip-version-check --no-cache-dir \
+                "requests==$REQUESTS_VERSION" "Pillow==$PILLOW_VERSION"
+
+              NAME=face-device-offline-kylin-v10sp3-arm64-python311
+              PKG=/io/dist/$NAME
+              mkdir -p "$PKG/python"
+              cp -a /opt/python/cp311-cp311/. "$PKG/python/"
+              cp /io/face-device-offline/face_device_menu.py "$PKG/face_device_menu.py"
+
+              cat > "$PKG/run.sh" <<'"'"'RUNEOF'"'"'
+          #!/usr/bin/env bash
+          set -e
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          cd "$ROOT"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            aarch64|arm64) ;;
+            *) echo "错误：此包只支持 ARM64/aarch64，当前架构：$ARCH" >&2; exit 2 ;;
+          esac
+          export PYTHONUTF8=1
+          export PYTHONHOME="$ROOT/python"
+          export LD_LIBRARY_PATH="$ROOT/python/lib:$ROOT/python/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$ROOT/python/bin/python3.11" "$ROOT/face_device_menu.py" "$@"
+          RUNEOF
+              chmod +x "$PKG/run.sh"
+
+              cat > "$PKG/README_OFFLINE.txt" <<EOF
+          Face Device Tool - 麒麟 V10 SP3 ARM64 离线可移植版
+          ======================================================
+          Python: $PYTHON_VERSION (ARM64)
+          Runtime baseline: manylinux_2_28 / glibc 2.28
+          requests: $REQUESTS_VERSION
+          Pillow: $PILLOW_VERSION
+          Source SHA256: $SOURCE_SHA256
+
+          使用：
+            tar -xzf face-device-offline-kylin-v10sp3-arm64-python311.tar.gz
+            cd face-device-offline-kylin-v10sp3-arm64-python311
+            chmod +x run.sh
+            ./run.sh
+
+          目标机无需联网、无需安装 Python、无需执行 pip install。
+          脚本仍需要通过局域网访问实际人脸设备的 IP 和端口。
+          EOF
+
+              cat > "$PKG/BUILD_INFO.json" <<EOF
+          {
+            "platform": "linux-arm64-kylin-v10sp3",
+            "runtime_baseline": "manylinux_2_28",
+            "minimum_glibc": "2.28",
+            "python": "$PYTHON_VERSION",
+            "requests": "$REQUESTS_VERSION",
+            "pillow": "$PILLOW_VERSION",
+            "source_sha256": "$SOURCE_SHA256",
+            "portable": true,
+            "target_requires_python": false,
+            "target_requires_internet": false
+          }
+          EOF
+
+              file "$PKG/python/bin/python3.11"
+              file "$PKG/python/bin/python3.11" | grep -Eiq "aarch64|ARM"
+              PYTHONHOME="$PKG/python" \
+              LD_LIBRARY_PATH="$PKG/python/lib:$PKG/python/lib64" \
+              "$PKG/python/bin/python3.11" -c "import requests; from PIL import Image; import py_compile; py_compile.compile('/io/dist/face-device-offline-kylin-v10sp3-arm64-python311/face_device_menu.py', doraise=True); print('Kylin ARM64 portable smoke test OK')"
+            '
+
+      - name: Create Linux archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=face-device-offline-kylin-v10sp3-arm64-python311
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          ls -lh "dist/$name.tar.gz"
+          cat "dist/$name.tar.gz.sha256"
+
+      - name: Upload Kylin ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: face-device-offline-kylin-v10sp3-arm64-python311
+          path: |
+            dist/face-device-offline-kylin-v10sp3-arm64-python311.tar.gz
+            dist/face-device-offline-kylin-v10sp3-arm64-python311.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
