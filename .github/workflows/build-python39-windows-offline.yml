@@ -1,0 +1,108 @@
+name: Build Python 3.9.2 Windows Offline Packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - build/python392-win-offline-packages
+    paths:
+      - 'python39-windows-offline/**'
+      - '.github/workflows/build-python39-windows-offline.yml'
+  pull_request:
+    paths:
+      - 'python39-windows-offline/**'
+      - '.github/workflows/build-python39-windows-offline.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    name: Windows x64 / CPython 3.9.2
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up CPython 3.9.2 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9.2'
+          architecture: 'x64'
+
+      - name: Verify Python runtime
+        shell: pwsh
+        run: |
+          python --version
+          python -c "import sys, platform; print(sys.executable); print(platform.platform()); assert sys.version_info[:3] == (3, 9, 2), sys.version; assert platform.architecture()[0] == '64bit'"
+          python -m pip --version
+
+      - name: Download Windows x64 wheels and dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $PWD 'python39-windows-offline'
+          $dist = Join-Path $PWD 'dist'
+          $packages = Join-Path $dist 'packages'
+
+          New-Item -ItemType Directory -Force -Path $packages | Out-Null
+          Copy-Item (Join-Path $source 'requirements.txt') (Join-Path $dist 'requirements.txt')
+          Copy-Item (Join-Path $source 'install-offline.bat') (Join-Path $dist 'install-offline.bat')
+          Copy-Item (Join-Path $source 'README.md') (Join-Path $dist 'README.md')
+
+          python -m pip install --upgrade 'pip<26'
+          python -m pip download `
+            --only-binary=:all: `
+            --dest $packages `
+            --requirement (Join-Path $source 'requirements.txt')
+
+          $count = (Get-ChildItem $packages -File).Count
+          if ($count -lt 3) {
+            throw "Expected dependency wheels, but only found $count files."
+          }
+          Write-Host "Downloaded $count package files."
+
+      - name: Prove fully offline installation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $PWD 'dist'
+          $packages = Join-Path $dist 'packages'
+          $venv = Join-Path $PWD '.venv-offline-test'
+
+          python -m venv $venv
+          $testPython = Join-Path $venv 'Scripts/python.exe'
+
+          & $testPython -m pip install `
+            --no-index `
+            --find-links $packages `
+            --requirement (Join-Path $dist 'requirements.txt')
+
+          & $testPython -c "import requests, pandas, openpyxl; print('requests=' + requests.__version__); print('pandas=' + pandas.__version__); print('openpyxl=' + openpyxl.__version__)"
+          & $testPython -m pip check
+          & $testPython -m pip freeze | Set-Content -Encoding utf8 (Join-Path $dist 'resolved-versions.txt')
+
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $PWD 'dist'
+          $packages = Join-Path $dist 'packages'
+          $lines = Get-ChildItem $packages -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  packages/$($_.Name)"
+          }
+          $lines | Set-Content -Encoding ascii (Join-Path $dist 'SHA256SUMS.txt')
+          Get-Content (Join-Path $dist 'resolved-versions.txt')
+          Get-Content (Join-Path $dist 'SHA256SUMS.txt')
+
+      - name: Upload offline bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-3.9.2-windows-x64-offline
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
