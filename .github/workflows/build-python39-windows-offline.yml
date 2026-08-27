@@ -1,4 +1,4 @@
-name: Build Python 3.9.2 Windows Offline Packages
+name: Build Python 3.9.2 Windows Complete Offline Bundle
 
 on:
   workflow_dispatch:
@@ -19,62 +19,113 @@ permissions:
 
 jobs:
   build-and-verify:
-    name: Windows x64 / CPython 3.9.2
+    name: Windows x64 / CPython 3.9.2 complete offline
     runs-on: windows-2022
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up CPython 3.9.2 x64
+      - name: Set up CPython 3.9.2 x64 for bundle creation
         uses: actions/setup-python@v5
         with:
           python-version: '3.9.2'
           architecture: 'x64'
 
-      - name: Verify Python runtime
+      - name: Verify build Python runtime
         shell: pwsh
         run: |
           python --version
           python -c "import sys, platform; print(sys.executable); print(platform.platform()); assert sys.version_info[:3] == (3, 9, 2), sys.version; assert platform.architecture()[0] == '64bit'"
           python -m pip --version
 
-      - name: Download Windows x64 wheels and dependencies
+      - name: Download official Python installer and Windows wheels
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $source = Join-Path $PWD 'python39-windows-offline'
           $dist = Join-Path $PWD 'dist'
           $packages = Join-Path $dist 'packages'
+          $installer = Join-Path $dist 'python-3.9.2-amd64.exe'
+          $installerUrl = 'https://www.python.org/ftp/python/3.9.2/python-3.9.2-amd64.exe'
 
           New-Item -ItemType Directory -Force -Path $packages | Out-Null
           Copy-Item (Join-Path $source 'requirements.txt') (Join-Path $dist 'requirements.txt')
           Copy-Item (Join-Path $source 'install-offline.bat') (Join-Path $dist 'install-offline.bat')
           Copy-Item (Join-Path $source 'README.md') (Join-Path $dist 'README.md')
+          $installerUrl | Set-Content -Encoding ascii (Join-Path $dist 'python-installer-source.txt')
+
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installer
+          if (-not (Test-Path $installer) -or (Get-Item $installer).Length -lt 10MB) {
+            throw 'Official Python installer download is missing or unexpectedly small.'
+          }
+
+          $signature = Get-AuthenticodeSignature $installer
+          Write-Host "Installer signature status: $($signature.Status)"
+          Write-Host "Installer signer: $($signature.SignerCertificate.Subject)"
+          if ($signature.Status -ne 'Valid') {
+            throw "Python installer Authenticode signature is not valid: $($signature.Status)"
+          }
+          if ($signature.SignerCertificate.Subject -notmatch 'Python Software Foundation') {
+            throw "Unexpected Python installer signer: $($signature.SignerCertificate.Subject)"
+          }
 
           python -m pip install --upgrade 'pip<26'
           python -m pip download `
             --only-binary=:all: `
             --dest $packages `
+            'pip<26' `
             --requirement (Join-Path $source 'requirements.txt')
 
           $count = (Get-ChildItem $packages -File).Count
-          if ($count -lt 3) {
-            throw "Expected dependency wheels, but only found $count files."
+          if ($count -lt 4) {
+            throw "Expected dependency wheels plus pip, but only found $count files."
           }
-          Write-Host "Downloaded $count package files."
+          Write-Host "Downloaded $count package files plus the official Python installer."
 
-      - name: Prove fully offline installation
+      - name: Prove clean install from bundled Python installer only
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $dist = Join-Path $PWD 'dist'
           $packages = Join-Path $dist 'packages'
-          $venv = Join-Path $PWD '.venv-offline-test'
+          $installer = Join-Path $dist 'python-3.9.2-amd64.exe'
+          $target = Join-Path $PWD 'python392-clean-test'
 
-          python -m venv $venv
-          $testPython = Join-Path $venv 'Scripts/python.exe'
+          $arguments = @(
+            '/quiet',
+            'InstallAllUsers=0',
+            "TargetDir=$target",
+            'PrependPath=0',
+            'Include_pip=1',
+            'Include_launcher=0',
+            'InstallLauncherAllUsers=0',
+            'Include_test=0',
+            'AssociateFiles=0',
+            'Shortcuts=0'
+          )
 
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Bundled Python installer exited with code $($process.ExitCode)."
+          }
+
+          $testPython = Join-Path $target 'python.exe'
+          if (-not (Test-Path $testPython)) {
+            throw "Installed python.exe not found at $testPython"
+          }
+
+          & $testPython --version
+          & $testPython -c "import sys, platform; assert sys.version_info[:3] == (3,9,2), sys.version; assert platform.architecture()[0] == '64bit'; print(sys.executable)"
+          & $testPython -m pip --version
+
+          # Upgrade pip using only the bundled local wheel directory.
+          & $testPython -m pip install `
+            --no-index `
+            --find-links $packages `
+            'pip<26'
+
+          # Install requested dependencies using only local wheels.
           & $testPython -m pip install `
             --no-index `
             --find-links $packages `
@@ -89,19 +140,25 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $dist = Join-Path $PWD 'dist'
-          $packages = Join-Path $dist 'packages'
-          $lines = Get-ChildItem $packages -File | Sort-Object Name | ForEach-Object {
+
+          $files = @()
+          $files += Get-Item (Join-Path $dist 'python-3.9.2-amd64.exe')
+          $files += Get-ChildItem (Join-Path $dist 'packages') -File
+
+          $lines = $files | Sort-Object FullName | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  packages/$($_.Name)"
+            $relative = [IO.Path]::GetRelativePath($dist, $_.FullName).Replace('\', '/')
+            "$hash  $relative"
           }
           $lines | Set-Content -Encoding ascii (Join-Path $dist 'SHA256SUMS.txt')
+
           Get-Content (Join-Path $dist 'resolved-versions.txt')
           Get-Content (Join-Path $dist 'SHA256SUMS.txt')
 
-      - name: Upload offline bundle
+      - name: Upload complete offline bundle
         uses: actions/upload-artifact@v4
         with:
-          name: python-3.9.2-windows-x64-offline
+          name: python-3.9.2-windows-x64-complete-offline
           path: dist/
           if-no-files-found: error
           retention-days: 30
